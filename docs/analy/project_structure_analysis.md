@@ -1,9 +1,12 @@
-# UniLab 工程结构分析
+# UniLab 工程结构与控制器架构深度分析
 
-> 生成日期：2026-06-07
+> 生成日期：2026-06-08
 > 对应版本：`main` 分支 @ `43c2c77c`
+> 核心动机：理解工程结构 + PD 控制器分布 + 为引入 Pinocchio 高级控制器（动力学补偿 / 自抗扰）做架构准备
 
 ---
+
+# 第一部分：工程结构
 
 ## 1. 项目概览
 
@@ -214,48 +217,17 @@ algos/
 │   ├── rsl_rl_ppo.py       # PPO（基于 rsl-rl-lib）
 │   ├── rsl_rl_runtime.py   # PPO 运行时解析
 │   ├── appo/               # APPO（异步 PPO）
-│   │   ├── learner.py      # APPO Learner
-│   │   ├── worker.py       # APPO Worker（数据采集）
-│   │   ├── runner.py       # APPO Runner（多进程编排）
-│   │   ├── runtime.py      # APPO 运行时解析
-│   │   └── staging.py      # 数据暂存
+│   │   ├── learner.py, worker.py, runner.py, runtime.py, staging.py
 │   ├── offpolicy/          # Off-policy 通用框架
-│   │   ├── runner.py       # 单 GPU runner
-│   │   ├── double_buffer_runner.py  # 双缓冲 runner
-│   │   ├── multi_gpu_runner.py      # 多 GPU runner
-│   │   ├── worker.py       # 采集 worker
-│   │   └── runtime.py      # 运行时解析
+│   │   ├── runner.py, double_buffer_runner.py, multi_gpu_runner.py, worker.py, runtime.py
 │   ├── fast_sac/            # FastSAC（高性能 SAC）
-│   │   ├── learner.py, runner.py
 │   ├── fast_td3/            # FastTD3
-│   │   ├── learner.py, runner.py
 │   ├── flash_sac/           # FlashSAC（分布式 SAC）
-│   │   ├── learner.py, runner.py, network.py, layers.py
-│   │   ├── double_buffer.py, update.py
 │   ├── him_ppo/             # HIM-PPO（混合优势估计）
-│   │   ├── actor_critic.py, algorithm.py, estimator.py
-│   │   ├── runner.py, storage.py
 │   ├── hora/                # HORA（层次化策略蒸馏）
-│   │   ├── appo.py / appo_learner.py / appo_runner.py / appo_worker.py
-│   │   ├── sac.py / sac_learner.py / sac_models.py
-│   │   ├── distill.py / distill_config.py
-│   │   ├── models.py, observations.py, runtime.py
-│   │   ├── ppo.py, rsl_rl.py, rsl_rl_compat.py
 │   └── common/             # 算法共享组件
-│       ├── networks.py     # 神经网络基础模块
-│       ├── normalization.py # 归一化
-│       ├── actor_factory.py # Actor 工厂
-│       ├── ane_actor.py / ane_inference.py / ane_wrapper.py  # ANE 加速
-│       ├── base_collector.py # 数据采集基类
-│       ├── device.py       # 设备管理
-│       └── stability.py    # 训练稳定性工具
 └── mlx/                    # Apple MLX 算法
     └── ppo/                # MLX-PPO
-        ├── model.py, ppo.py, runner.py
-        └── common/         # MLX 共享组件
-            ├── activations.py, distributions.py
-            ├── mlp.py, normalization.py
-            ├── rotation.py, rollout_storage.py
 ```
 
 **算法矩阵**：
@@ -287,18 +259,6 @@ training/
 └── __init__.py             # 导出 ensure_registries, create_env, BackendAdapter 等
 ```
 
-**关键流程**（以 PPO 为例）：
-
-```
-train_rsl_rl.py
-  → ensure_registries()            # 自动发现并注册所有环境
-  → BackendAdapter.create_env()    # 根据 cfg 创建 SimBackend + NpEnv
-  → RslRlVecEnvWrapper(env)        # 包装为 rsl-rl 兼容接口
-  → OnPolicyRunner(env, cfg)       # rsl-rl runner
-  → runner.learn()                 # 训练循环
-  → should_run_playback()          # 判断是否执行 playback
-```
-
 ### 4.5 `src/unilab/ipc/` — 进程间通信与异步训练
 
 ```
@@ -312,14 +272,6 @@ ipc/
 ├── collector_error.py          # 采集进程错误传播
 ├── memory_budget.py            # 内存预算管理
 └── replay_pipelines/           # Replay 数据传输管线
-    ├── base.py                 # 管线基类
-    ├── cpu_pinned_double_buffer.py  # CPU Pinned 双缓冲
-    ├── native_h2d.py           # 原生 Host-to-Device
-    └── transfer/               # 传输后端
-        ├── base.py, factory.py
-        ├── torch_copy.py       # PyTorch Copy
-        ├── cuda_like.py        # CUDA-like
-        └── xpu.py              # Intel XPU
 ```
 
 ### 4.6 `src/unilab/dr/` — Domain Randomization
@@ -342,10 +294,10 @@ dr/
 
 | 模块 | 路径 | 说明 |
 |------|------|------|
-| 可视化 | `src/unilab/visualization/` | `playback.py`（通用回放）, `interactive_playback.py`（交互式）, `viser_scene.py`（Viser 3D 可视化）, `render_many.py`（批量渲染） |
-| 地形 | `src/unilab/terrains/` | `terrain_generator.py`（程序化地形生成）, `heightfield_terrains.py`（高度场地形）, `config.py`, `utils.py` |
-| 工具 | `src/unilab/tools/` | `completion.py`（Shell 补全）, `export_scene.py`（场景导出）, `import_robot.py`（机器人导入）, `render_teaser.py`（演示渲染）, `viz_nan.py`（NaN 可视化） |
-| 工具类 | `src/unilab/utils/` | `device.py`（设备检测）, `tensor.py`（张量工具）, `nan_guard.py`（NaN 防护）, `support_matrix.py`（支持矩阵） |
+| 可视化 | `src/unilab/visualization/` | `playback.py`, `interactive_playback.py`, `viser_scene.py`, `render_many.py` |
+| 地形 | `src/unilab/terrains/` | `terrain_generator.py`, `heightfield_terrains.py`, `config.py`, `utils.py` |
+| 工具 | `src/unilab/tools/` | `completion.py`, `export_scene.py`, `import_robot.py`, `render_teaser.py`, `viz_nan.py` |
+| 工具类 | `src/unilab/utils/` | `device.py`, `tensor.py`, `nan_guard.py`, `support_matrix.py` |
 | 日志 | `src/unilab/logging/` | `common.py`, `onpolicy.py`, `offpolicy.py`, `trace_event.py` |
 
 ---
@@ -362,100 +314,17 @@ conf/
 │   ├── config.yaml         # 全局默认 + 默认 task
 │   ├── config_mlx.yaml     # MLX-PPO 变体
 │   └── task/               # 任务配置（每个任务 × 每个后端 = 一个 YAML）
-│       ├── g1_walk_flat/
-│       │   ├── mujoco.yaml # G1 平地行走 (MuJoCo)
-│       │   └── motrix.yaml # G1 平地行走 (Motrix)
-│       ├── go2_joystick_flat/
-│       │   ├── mujoco.yaml
-│       │   └── motrix.yaml
-│       └── ...
 ├── appo/                   # APPO 训练配置
-│   ├── config.yaml
-│   └── task/...
 ├── offpolicy/              # Off-policy (SAC/TD3/FlashSAC) 配置
-│   ├── config.yaml
-│   ├── algo/               # 算法级配置
-│   │   ├── sac.yaml
-│   │   ├── td3.yaml
-│   │   └── flashsac.yaml
-│   └── task/               # 任务配置（按 algo/task/backend 三级）
-│       ├── sac/g1_walk_flat/mujoco.yaml
-│       └── ...
 ├── ppo_him/                # HIM-PPO 配置
-│   ├── config.yaml
-│   └── task/...
 └── hora_distill/           # HORA 蒸馏配置
-    ├── config.yaml
-    └── task/...
 ```
 
 ### 5.2 配置组成模式
 
-每个训练入口通过 Hydra `@hydra.main` 装饰器加载配置。典型组成：
-
-```yaml
-# conf/ppo/config.yaml
-defaults:
-  - _self_
-  - task: go1_joystick_flat/mujoco   # 默认任务
-
-algo:           # 算法超参（对应 structured_configs.py 中的 PPOConfig）
-  algo: ppo
-  num_envs: 4096
-  algorithm:
-    clip_param: 0.2
-    ...
-
-training:       # 训练控制（设备、日志、playback 等）
-  task_name: Go1JoystickFlat
-  sim_backend: mujoco
-  device: null
-  ...
-
-env:            # 环境覆盖（control_config, noise_config 等）
-  ...
-
-reward:         # Reward 权重覆盖
-  ...
-
-interactive:    # 交互式 playback 配置
-  ...
-
-hydra:          # Hydra 自身配置
-  run:
-    dir: .
-```
-
 **关键规则**：后端切换必须通过 `task=<task>/<backend>` 选择 owner YAML，`training.sim_backend` 只是 owner YAML 的身份字段，不能单独 override 来切后端。
 
-### 5.3 任务 YAML 示例（`conf/ppo/task/g1_walk_flat/mujoco.yaml`）
-
-```yaml
-# @package _global_
-training:
-  task_name: G1WalkFlat
-  sim_backend: mujoco
-algo:
-  num_envs: 2048
-  max_iterations: 2200
-  obs_groups:
-    actor:
-      - actor
-env:
-  control_config:
-    action_scale: 0.25
-  noise_config:
-    level: 1.0
-  ...
-reward:
-  scales:
-    tracking_lin_vel: 2.0
-    tracking_ang_vel: 0.2
-    feet_phase: 1.0
-    ...
-```
-
-### 5.4 结构化配置（`src/unilab/structured_configs.py`）
+### 5.3 结构化配置（`src/unilab/structured_configs.py`）
 
 所有算法的配置由 dataclass 定义，确保类型安全：
 
@@ -469,50 +338,12 @@ reward:
 
 ---
 
-## 6. 训练入口脚本
-
-| 脚本 | 算法 | 说明 |
-|------|------|------|
-| `scripts/train_rsl_rl.py` | PPO | 基于 rsl-rl-lib 的 On-policy PPO，单进程 |
-| `scripts/train_appo.py` | APPO | 异步 PPO，多进程（Collector + Learner） |
-| `scripts/train_mlx_ppo.py` | MLX-PPO | Apple MLX 框架上的 PPO |
-| `scripts/train_offpolicy.py` | SAC/TD3/FastSAC/FlashSAC | 统一 Off-policy 入口 |
-| `scripts/train_him_ppo.py` | HIM-PPO | 混合优势估计 PPO |
-| `scripts/train_hora_distill.py` | HORA | 层次化策略蒸馏 |
-| `scripts/play_interactive.py` | — | 交互式回放 |
-| `scripts/play_viser.py` | — | Viser 3D 可视化回放 |
-| `scripts/visualize_task_env.py` | — | 可视化任务环境 |
-
-**训练脚本统一模式**：
-
-```python
-@hydra.main(config_path="../conf/ppo", config_name="config")
-def main(cfg: DictConfig):
-    ensure_registries()                         # 1. 注册环境
-    env = create_env(cfg)                       # 2. 创建 Env + Backend
-    runner = resolve_runtime(env, cfg)           # 3. 解析运行时
-    runner.learn()                               # 4. 训练
-    if should_run_playback(...):                 # 5. Playback
-        ...
-```
-
----
-
-## 7. 资产体系
+## 6. 资产体系
 
 ```
 src/unilab/assets/
-├── robots/                 # 机器人模型
+├── robots/                 # 机器人模型（全部 MJCF 格式，无 URDF）
 │   ├── g1/                 # G1 人形
-│   │   ├── g1.xml          # 机器人 URDF/MJCF 描述
-│   │   ├── g1_sphere_hand.xml
-│   │   ├── locomotion_task.xml   # 任务级 keyframe（stand/home 等）
-│   │   ├── scene_flat.xml  # 场景 fragment
-│   │   ├── scene_rough.xml
-│   │   ├── scene_climb_*.xml
-│   │   ├── hfields/        # 高度场
-│   │   ├── assets/         # 网格/纹理
-│   │   └── textures/
 │   ├── go1/                # Go1 四足
 │   ├── go2/                # Go2 四足
 │   ├── go2_arm/            # Go2 + 机械臂
@@ -521,10 +352,8 @@ src/unilab/assets/
 │   ├── sharpa_wave/        # Sharpa Wave 手
 │   └── hfields/            # 全局高度场
 ├── scenes/                 # 全局场景资源
-├── motions/                # 运动数据
-│   └── g1/                 # G1 运动轨迹（.npz）
+├── motions/                # 运动数据（.npz）
 ├── objects/                # 操作对象
-│   └── sharpa_cylinder/    # Sharpa 圆柱
 └── caches/                 # 缓存
 ```
 
@@ -532,114 +361,35 @@ src/unilab/assets/
 
 - `<keyframe>` 必须放在 task-level XML（`scene_*.xml` 或 `locomotion_task.xml`），**禁止放进 robot.xml**
 - robot.xml 是纯机器人描述（body / joint / actuator / sensor），跟 task / 场景无关
-- Motrix 后端需要 keyframe 时通过 `scene.fragment_files` 引用 fragment XML
 - `ASSETS_ROOT_PATH`、`model_file` 等元数据只允许在 init / materialization / cache 等低频路径访问
 
 ---
 
-## 8. 测试体系
+## 7. 测试体系
 
 ```
 tests/
-├── conftest.py             # 全局 fixture
-├── base/                   # 基础层测试
-│   ├── test_np_env.py      # NpEnv Contract 测试
-│   ├── test_sim_backend.py # SimBackend Contract 测试
-│   ├── test_registry.py    # Registry 测试
-│   ├── test_backend_imports.py
-│   ├── test_backend_pre_step_control.py
-│   ├── test_motrix_backend_options.py
-│   ├── test_mujoco_batch_env_*.py
-│   └── test_reward_override.py
-├── algos/                  # 算法层测试
-│   ├── test_rsl_rl_ppo.py / test_rsl_rl_runner.py
-│   ├── test_appo_*.py      # APPO (learner, runner, worker, staging, metrics)
-│   ├── test_mlx_ppo.py
-│   ├── test_offpolicy_*.py # Off-policy (runner, worker, runtime, bootstrap)
-│   ├── test_fast_sac_*.py
-│   ├── test_fast_td3_learner.py
-│   ├── test_flash_sac_learner.py
-│   ├── test_hora_*.py
-│   └── test_him_ppo.py (implied by storage)
-├── envs/                   # 环境层测试
-│   ├── test_env_configs.py
-│   ├── test_*_domain_randomization.py
-│   ├── test_*_obs_noise.py
-│   ├── test_motion_loader.py
-│   └── test_sharpa.py
-├── ipc/                    # IPC 层测试
-│   ├── test_async_runner.py
-│   ├── test_replay_buffer.py / test_replay_pipeline_double_buffer.py
-│   ├── test_rollout_ring_buffer.py
-│   ├── test_shared_obs_stats.py / test_shared_weight_sync.py
+├── base/                   # 基础层测试（NpEnv, SimBackend, Registry）
+├── algos/                  # 算法层测试（PPO, APPO, MLX, Off-policy, HORA）
+├── envs/                   # 环境层测试（DR, obs_noise, motion_loader）
+├── ipc/                    # IPC 层测试（async_runner, replay_buffer, weight_sync）
 ├── config/                 # 配置测试
-│   ├── test_config_system.py
-│   ├── test_locomotion_params.py
-│   └── test_reward_injection.py
 ├── integration/            # 集成测试
-│   ├── test_appo_rsl_reward.py
-│   └── test_reward_injection_integration.py
 ├── dr/                     # Domain Randomization 测试
-│   └── test_manager.py
 ├── terrains/               # 地形测试
-│   └── test_terrain_generator.py
 ├── training/               # 训练辅助测试
-│   ├── test_training_helpers.py
-│   ├── test_resume_logger_state.py
-│   └── test_seed_contract.py
 ├── utils/                  # 工具测试
 ├── visualization/          # 可视化测试
-├── scripts/                # 脚本测试（hygiene, doc checks, 配置验证）
+├── scripts/                # 脚本测试
 ├── benchmark/              # 性能基准测试
 └── cli/                    # CLI 入口测试
 ```
 
-**测试命令**（via Makefile）：
-
-```bash
-make test          # pytest -m "not slow"
-make test-cov      # pytest -m "not slow" --cov
-make test-slow     # pytest -m "slow" -v
-make test-all      # format + type + test-cov
-```
+**测试命令**（via Makefile）：`make test` / `make test-cov` / `make test-slow` / `make test-all`
 
 ---
 
-## 9. 文档体系
-
-```
-docs/
-├── README.md               # 文档索引
-├── analy/                  # 分析文档
-└── sphinx/                 # Sphinx 文档源码
-    ├── Makefile
-    ├── README.md           # 构建与部署说明
-    ├── AGENTS.md           # Agent 写文档规范
-    ├── requirements.txt
-    └── source/
-        ├── index.md        # Sphinx 入口
-        ├── conf.py         # Sphinx 配置
-        ├── glossary.md     # 术语表（共享）
-        ├── changelog.md    # 变更日志（共享）
-        ├── en/             # 英文文档
-        │   ├── 1-getting_started/   # 快速开始
-        │   ├── 2-user_guide/        # 用户指南（训练、算法、后端、任务、DR、地形、工具、操作）
-        │   ├── 3-deployment/        # 部署（Sim-to-Real、Sim-to-Sim、框架迁移）
-        │   ├── 4-developer_guide/   # 开发者指南（架构、Contract、扩展、贡献）
-        │   └── 5-reference/         # 参考（API、术语表、Changelog、ADR、支持矩阵）
-        ├── zh_CN/          # 中文文档（与 en/ 结构平行）
-        ├── adr/            # Architecture Decision Records
-        │   ├── ADR-0001-runtime-model-and-layer-boundaries.md
-        │   ├── ADR-0002-backend-capability-boundary-for-play-and-snapshot.md
-        │   ├── ADR-0003-task-owner-and-config-compose-contract.md
-        │   ├── ADR-0004-registry-bootstrap-contract.md
-        │   └── ADR-0005-unified-obs-critic-env-and-ipc-contract.md
-        └── api_reference/  # API 自动文档（autodoc）
-```
-
----
-
-## 10. CI/CD
+## 8. CI/CD
 
 ```
 .github/
@@ -649,14 +399,677 @@ docs/
 ├── CODEOWNERS
 ├── pull_request_template.md
 └── ISSUE_TEMPLATE/
-    ├── bug_report.yml
-    ├── config.yml
-    └── work_item.yml
 ```
 
 ---
 
-## 附录：关键文件速查
+# 第二部分：PD 控制器架构分析
+
+## 9. 核心发现：PD 控制存在于两个层次
+
+UniLab 中的 PD 控制分布在**两个完全不同的层次**，理解这一区分是替换工作的前提：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 层次 1: Env 层 apply_action() — 策略输出 → 目标位置             │
+│   actions * action_scale + default_angles → ctrl (目标位置)      │
+│   这是 "policy → target" 的映射，PD 增益不在此层                │
+├─────────────────────────────────────────────────────────────────┤
+│ 层次 2: Backend 层 / pre_step_control — 目标位置 → 力矩         │
+│   Kp * (target - qpos) - Kd * qvel → torque                    │
+│   这是 "target → torque" 的映射，PD 增益在此层生效              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键区别**：
+- 层次 1 输出的是**目标位置**（position setpoint），交给 MuJoCo/Motrix 的 position actuator
+- 层次 2 是**真正的 PD 计算**，把目标位置转为力矩——这正是需要替换的部分
+
+---
+
+## 10. 层次 1：Env 层 `apply_action()` — 目标生成
+
+### 10.1 基类：`LocomotionBaseEnv.apply_action()`
+
+文件：`src/unilab/envs/locomotion/common/base.py:91-102`
+
+```python
+def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
+    state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
+    state.info["current_actions"] = actions
+    exec_actions = (
+        state.info["last_actions"]
+        if self._cfg.control_config.simulate_action_latency
+        else actions
+    )
+    ctrl: np.ndarray = (
+        exec_actions * self._cfg.control_config.action_scale + self.default_angles
+    )
+    return ctrl
+```
+
+**作用**：将策略输出 `actions`（通常 ∈ [-1, 1]）通过 `action_scale` 缩放后加上 `default_angles`，得到**目标关节位置** `ctrl`。
+
+### 10.2 各子类的 `apply_action()` 变体
+
+| 环境类 | 文件 | 行为特点 |
+|--------|------|---------|
+| `LocomotionBaseEnv` | `common/base.py:91` | 标准模式：`actions * action_scale + default_angles` |
+| `G1JoystickWalkTask` | `g1/joystick.py:629` | 同标准模式 |
+| `Go2RoughTask` | `go2/rough.py:357` | 增加 `clip_actions`，用独立 `_action_scale` 数组（hip/非hip 不同缩放） |
+| `Go2FootStandTask` | `go2/footstand.py:384` | 累积式：`_motor_targets += exec_actions * action_scale`，目标逐帧累加 |
+| `Go2WJoystickFlatTask` | `go2w/joystick.py:363` | 腿部目标位置 + 轮部目标速度，分离处理 |
+| `G1MotionTrackingEnv` | `motion_tracking/g1/tracking.py:602` | 同标准模式 + `default_dof_pos_bias` |
+| `AllegroInhandEnv` | `manipulation/allegro_inhand/base.py:107` | 累积式：`prev_ctrl + action_scale * clipped_actions` |
+| `SharpaInhandEnv` | `manipulation/sharpa_inhand/rotation.py` | 类似 Allegro，声明了 `torque_control` 但当前强制为 `False` |
+
+### 10.3 控制配置继承体系
+
+```
+ControlConfigBase (common/base.py:23)
+  ├── action_scale: float = 0.25
+  ├── simulate_action_latency: bool = False
+  │
+  └── PdControlConfig (common/base.py:29)  ← Go1/Go2/Go2W 用这个
+        ├── Kp: float = 35.0
+        └── Kd: float = 0.5
+
+各机器人子类覆写：
+  G1: ControlConfig (g1/base.py:26) → 直接继承 ControlConfigBase，无 Kp/Kd
+  Go2: ControlConfig (go2/base.py:21) → 继承 PdControlConfig
+  Go2W: ControlConfig (go2w/base.py:64) → 继承 PdControlConfig + wheel_Kd
+  Go2 Rough: RoughControlConfig (go2/rough.py:69) → + hip/non_hip_action_scale, clip_actions
+  Footstand: FootstandControlConfig (go2/footstand.py:56) → + clip_actions
+  Sharpa: SharpaControlConfig (sharpa_inhand/base.py:80) → + p_gain, d_gain, torque_control
+  Allegro: (内联在 base.py:22) → kp=1.0, kd=0.1
+```
+
+---
+
+## 11. 层次 2：Backend 层 — PD 力矩计算（真正需要替换的部分）
+
+PD 力矩计算有**两种实现路径**：
+
+### 11.1 路径 A：MuJoCo Position Actuator（内建 PD）
+
+**这是大多数环境使用的方式。**
+
+MuJoCo XML 中定义 position actuator：
+```xml
+<actuator>
+  <position name="hip" joint="hip_joint" kp="35"/>
+</actuator>
+```
+
+MuJoCo 内部自动计算：`torque = kp * (target - qpos) - kd * qvel`
+
+**`position_actuator_gains` 覆盖机制**：
+
+文件：`src/unilab/base/backend/mujoco/backend.py:166-178`
+
+```python
+def _apply_position_actuator_gains_to_mj_model(
+    model, *, kp, kd, actuator_ids=slice(None),
+) -> None:
+    model.actuator_gainprm[actuator_ids, 0] = kp_arr
+    model.actuator_biasprm[actuator_ids, 1] = -kp_arr
+    model.actuator_biasprm[actuator_ids, 2] = -kd_arr
+```
+
+各环境在创建 backend 时传入 `position_actuator_gains`：
+
+| 环境类 | 文件 | 传入方式 |
+|--------|------|---------|
+| `Go2JoystickFlatTask` | `go2/joystick.py:115` | `{"kp": cfg.control_config.Kp, "kd": cfg.control_config.Kd}` |
+| `Go1JoystickFlatTask` | `go1/joystick.py:105` | 同上 |
+| `Go2HandStandTask` | `go2/handstand.py:141` | 同上 |
+| `Go2ArmManipLocoEnv` | `go2_arm/manip_loco.py:303` | `build_go2_arm_position_gains(cfg)` — 腿/臂不同增益 |
+| `AllegroInhandEnv` | `allegro_inhand/rotation.py:272` | `{"kp": cfg.control_config.kp, "kd": cfg.control_config.kd}` |
+
+**G1 环境没有传入**：G1 的 `ControlConfig` 不继承 `PdControlConfig`，没有 `Kp/Kd` 字段。G1 直接使用 XML 中的默认 actuator 增益。
+
+### 11.2 路径 B：`pre_step_control` 回调（显式 PD 计算）
+
+**Go2W 轮腿机器人使用这种方式**，因为它需要对腿部和轮部使用不同的控制逻辑。
+
+文件：`src/unilab/envs/locomotion/go2w/base.py:93-116`
+
+```python
+def compute_go2w_motor_ctrl(
+    policy_ctrl, joint_pos, joint_vel,
+    leg_kp, leg_kd, wheel_kd,
+    ctrl_lower, ctrl_upper, out,
+) -> np.ndarray:
+    leg_out = out[:, :NUM_LEG_ACTIONS]
+    np.subtract(policy_ctrl[:, :NUM_LEG_ACTIONS], joint_pos[:, :NUM_LEG_ACTIONS], out=leg_out)
+    np.multiply(leg_out, leg_kp, out=leg_out)
+    leg_out -= leg_kd * joint_vel[:, :NUM_LEG_ACTIONS]
+    ...
+```
+
+**注册机制**：`self._backend.set_pre_step_control(self._pre_step_motor_control)`
+
+**`pre_step_control` 的调用链**：
+
+```
+NpEnv.step(actions)
+  → apply_action(actions) → ctrl (目标位置)
+  → backend.step(ctrl, nsteps)
+      → 如果有 _pre_step_control_fn:
+          → _step_with_pre_step_control(ctrl, nsteps)
+              → 每个 substep:
+                  native_ctrl = self._apply_pre_step_control(ctrl)  ← 在这里做 PD 计算
+                  pool.step(physics_state, nstep=1, control=native_ctrl)
+```
+
+### 11.3 路径 C：Env 层显式 PD 估算（仅用于 reward，不影响仿真）
+
+一些环境在 `update_state()` 中估算 PD 力矩，**仅用于 reward 计算**，不影响实际仿真：
+
+| 环境 | 文件位置 | 方法 |
+|------|---------|------|
+| `Go2RoughTask` | `go2/rough.py:523-539` | `_estimate_pd_torques()` |
+| `Go2FootStandTask` | `go2/footstand.py:659-666` | `_estimate_pd_torques()` |
+
+---
+
+## 12. 控制流全景图
+
+以 Go2 Joystick Flat 为例（**路径 A** — 最常见的模式）：
+
+```
+策略网络输出 actions ∈ [-1, 1]^{12}
+  │
+  ▼
+LocomotionBaseEnv.apply_action()          ← Env 层
+  ctrl = actions * 0.25 + default_angles   ← 目标关节位置
+  │
+  ▼
+NpEnv.step() → backend.step(ctrl, 3)      ← 3 个 sim substeps
+  │
+  ▼
+MuJoCo Position Actuator (内建 PD)        ← Backend 层（MuJoCo 自动）
+  torque = Kp * (ctrl - qpos) - Kd * qvel  ← 这是 PD 力矩
+  │
+  ▼
+MuJoCo 物理仿真 mj_step()
+```
+
+以 Go2W Joystick Flat 为例（**路径 B** — pre_step_control 模式）：
+
+```
+策略网络输出 actions ∈ [-1, 1]^{16}
+  │
+  ▼
+Go2WJoystickFlatTask.apply_action()       ← Env 层
+  leg_targets = actions[:,:12] * 0.25 + default_angles
+  wheel_vel_targets = actions[:,12:] * 10.0
+  ctrl = concat(leg_targets, wheel_vel_targets)
+  │
+  ▼
+NpEnv.step() → backend.step(ctrl, nsteps)
+  │
+  ▼
+_step_with_pre_step_control()             ← Backend 层（每个 substep 调用）
+  native_ctrl = _pre_step_motor_control(backend, ctrl)
+    │
+    ▼
+  compute_go2w_motor_ctrl()               ← 显式 PD 计算
+    leg_torque = leg_kp * (leg_target - leg_pos) - leg_kd * leg_vel
+    wheel_torque = wheel_kd * (wheel_vel_target - wheel_vel)
+  │
+  ▼
+MuJoCo 物理仿真 mj_step()（使用 native_ctrl 作为力矩）
+```
+
+---
+
+## 13. 替换高级控制器的切入点
+
+### 13.1 推荐切入点：`pre_step_control` 回调
+
+**`pre_step_control` 是替换 PD 控制器的最佳切入点**，理由：
+
+1. **已在 Go2W 中验证**：`compute_go2w_motor_ctrl()` 就是这个模式的生产级实例
+2. **每个 substep 调用**：可以在每个物理步读取当前状态（qpos, qvel, sensor data）并计算补偿力矩
+3. **不影响 Env Contract**：`apply_action()` 仍然返回目标位置，PD → 高级控制的替换完全在 backend 层完成
+4. **Backend 无关**：MuJoCo 和 Motrix 都支持 `pre_step_control`
+5. **可读取 backend 状态**：回调签名 `fn(backend, ctrl)` 可以访问 backend 的全部传感器和运动学接口
+
+### 13.2 需要修改的层次
+
+| 修改点 | 说明 | 影响范围 |
+|--------|------|---------|
+| **新增控制器模块** | `src/unilab/control/` | 新增代码，不影响现有 |
+| **Env 层 `apply_action()`** | 可能需要输出更丰富的信息（如前馈力矩） | 仅影响使用新控制器的 env |
+| **`ControlConfig` 配置** | 新增 `controller_type` / `controller_params` 字段 | 仅影响使用新控制器的 env |
+| **`pre_step_control` 回调** | 将 PD 替换为高级控制器 | 仅影响使用新控制器的 env |
+| **MuJoCo actuator 模式** | 如果用 `pre_step_control` 做力矩控制，需要将 XML actuator 改为 `motor`（纯力矩） | 仅影响使用新控制器的 env |
+
+---
+
+# 第三部分：引入 Pinocchio 高级控制器方案
+
+## 14. 为什么必须引入 Pinocchio（而非用 MuJoCo 内建动力学 API）
+
+| 维度 | MuJoCo 内建 API | Pinocchio |
+|------|----------------|-----------|
+| **sim2real 一致性** | ✗ 真机无法调用 MuJoCo API | ✓ 真机和仿真共用同一套动力学计算 |
+| **部署可行性** | ✗ MuJoCo 仅限仿真 | ✓ Pinocchio 可部署在嵌入式端 (C++ / 纯头文件) |
+| **建模来源** | MuJoCo 内部模型（与 XML 参数耦合） | 独立 URDF/MJCF，可与真机 SDK 共享 |
+| **动力学量精度** | 与 MuJoCo 仿真自身一致，但与真机有偏差 | 独立计算，可校准到与真机一致 |
+| **计算力矩控制 (CTC)** | 需要提取 `mj_fullM` + `qfrc_bias`，代码侵入 MuJoCo 内部 | `pinocchio.rnea(q, v, a)` 一行搞定 |
+| **自抗扰 (ADRC)** | 同上 | 同上 |
+
+**结论**：如果目标是在真机部署时用 Pinocchio 做动力学补偿 + ADRC，那仿真中**必须也用 Pinocchio**，否则补偿项不一致会直接引入 sim2real gap。
+
+---
+
+## 15. 现状盘点：缺少什么
+
+### 15.1 没有可用的 URDF
+
+当前资产全部是 MJCF（MuJoCo XML）格式，**没有 URDF 文件**。Pinocchio 需要 URDF 来构建动力学模型。**这是第一个要解决的阻塞项**。
+
+### 15.2 没有控制器抽象层
+
+当前 PD 控制是硬编码的两种方式：
+- MuJoCo position actuator（内建 PD）
+- Go2W 的 `compute_go2w_motor_ctrl()`（硬编码在 env 里）
+
+### 15.3 Backend 没有暴露动力学量查询接口
+
+`SimBackend` 目前不暴露 `qfrc_bias`（Coriolis+重力）、质量矩阵等。虽然用 Pinocchio 后不需要从 MuJoCo 读这些，但 `qpos`/`qvel` 的读取是 Pinocchio 计算的输入——这些已有。
+
+---
+
+## 16. URDF 获取路径
+
+### 16.1 路径 A：从厂商/社区获取现成 URDF
+
+| 机器人 | 可能来源 |
+|--------|---------|
+| G1 | Unitree 官方 SDK (`unitree_ros`)，GitHub 上有 `g1_description` URDF |
+| Go2 | Unitree 官方 `go2_description` URDF，`unitree_ros` 仓库 |
+| Go2W | 需要从 Go2 URDF 衍生 + 添加轮关节 |
+| Go2 Arm | 需要从 Go2 URDF 衍生 + 添加臂关节 |
+
+**注意**：URDF 中的惯性参数必须与仿真 MJCF 中的一致，否则 Pinocchio 的动力学计算与仿真对不上。
+
+### 16.2 路径 B：MJCF → URDF 转换
+
+UniLab 已有 `unilab-import-robot` 工具做 URDF → MJCF 转换，但**没有反向转换**。
+
+### 16.3 路径 C：Pinocchio 直接从 MJCF 加载（推荐探索）
+
+Pinocchio 3.x 支持 `pinocchio.MjcfModel`，可以直接加载 MJCF：
+
+```python
+import pinocchio as pin
+model = pin.buildModelFromMjcf("go2.xml")
+```
+
+**这是最优路径**——不需要额外维护 URDF，直接复用现有 MJCF，且惯性参数天然一致。
+
+> ⚠️ 需要验证：Pinocchio 的 MJCF 加载器是否完整支持所有 MJCF 特性（如 `freejoint`、`armature`、多重几何体等）。如果部分支持不完整，可能仍需回退到 URDF。
+
+---
+
+## 17. 控制器架构设计
+
+### 17.1 核心抽象：`MotorController`
+
+```python
+# src/unilab/control/base.py (提议)
+from __future__ import annotations
+import abc
+import numpy as np
+from unilab.base.backend import SimBackend
+
+
+class MotorController(abc.ABC):
+    """低层级电机控制器抽象。
+
+    在 pre_step_control 回调中被调用，每个物理 substep 前执行一次。
+    输入：策略输出的目标（来自 apply_action）+ 当前机器人状态
+    输出：实际施加的力矩（或修改后的 ctrl）
+    """
+
+    @abc.abstractmethod
+    def compute_torque(
+        self,
+        backend: SimBackend,
+        target: np.ndarray,       # apply_action 输出的目标 (num_envs, nu)
+        dof_pos: np.ndarray,      # 当前关节位置 (num_envs, nv)
+        dof_vel: np.ndarray,      # 当前关节速度 (num_envs, nv)
+    ) -> np.ndarray:
+        """计算实际输出力矩。返回 (num_envs, nu) 数组。"""
+
+    @abc.abstractmethod
+    def reset(self, env_ids: np.ndarray) -> None:
+        """重置指定环境的控制器内部状态（如 ESO 状态）。"""
+
+
+class PDController(MotorController):
+    """标准 PD 控制器（与现有行为等价）。"""
+
+    def __init__(self, kp: np.ndarray, kd: np.ndarray):
+        self._kp = kp
+        self._kd = kd
+
+    def compute_torque(self, backend, target, dof_pos, dof_vel):
+        return self._kp * (target - dof_pos) - self._kd * dof_vel
+
+    def reset(self, env_ids):
+        pass  # PD 无状态
+
+
+class CTCController(MotorController):
+    """计算力矩控制 (Computed Torque Control)。
+
+    τ = M(q) * [Kp*(q_d - q) + Kd*(q̇_d - q̇)] + c(q, q̇) + g(q)
+
+    使用 Pinocchio 计算 M, c+g，实现精确的反馈线性化。
+    """
+
+    def __init__(self, model, kp, kd):
+        self._model = model          # pinocchio.Model
+        self._data = model.createData()
+        self._kp = kp
+        self._kd = kd
+
+    def compute_torque(self, backend, target, dof_pos, dof_vel):
+        # 1. 从 backend 读取 generalized coordinates
+        # 2. Pinocchio 计算质量矩阵 + bias force
+        # 3. CTC 公式计算力矩
+        ...
+
+
+class ADRCController(MotorController):
+    """自抗扰控制器。
+
+    在 CTC 基础上添加扩张状态观测器 (ESO)，
+    估计并补偿未建模动态和外部扰动。
+
+    τ = M(q) * [Kp*(q_d - q) + Kd*(q̇_d - q̇) - z_3/b0] + c(q, q̇) + g(q)
+                                                         ↑ ESO 估计的扰动
+    """
+
+    def __init__(self, model, kp, kd, eso_bandwidth, b0):
+        self._model = model
+        self._data = model.createData()
+        self._kp = kp
+        self._kd = kd
+        self._eso_bandwidth = eso_bandwidth
+        self._b0 = b0
+        self._eso_states = None     # 扩张状态
+
+    def compute_torque(self, backend, target, dof_pos, dof_vel):
+        ...
+
+    def reset(self, env_ids):
+        self._eso_states[env_ids] = 0.0
+```
+
+### 17.2 与 `pre_step_control` 的集成
+
+```python
+# 在 env 的 __init__ 中：
+self._motor_controller = resolve_controller(cfg.control_config, robot_model)
+self._backend.set_pre_step_control(self._pre_step_motor_control)
+
+# pre_step_control 回调：
+def _pre_step_motor_control(self, backend, policy_ctrl):
+    dof_pos = backend.get_dof_pos()
+    dof_vel = backend.get_dof_vel()
+    return self._motor_controller.compute_torque(backend, policy_ctrl, dof_pos, dof_vel)
+```
+
+### 17.3 配置集成
+
+```python
+# 在 ControlConfig 中扩展
+@dataclass
+class AdvancedControlConfig(PdControlConfig):
+    controller_type: str = "pd"    # "pd" | "ctc" | "adrc" | "impedance"
+    # CTC 参数
+    use_gravity_comp: bool = True
+    use_coriolis_comp: bool = True
+    # ADRC 参数
+    adrc_eso_bandwidth: float = 10.0
+    adrc_b0: float = 1.0
+```
+
+```yaml
+# YAML 配置示例
+env:
+  control_config:
+    controller_type: "adrc"
+    Kp: 35.0
+    Kd: 0.5
+    use_gravity_comp: true
+    use_coriolis_comp: true
+    adrc_eso_bandwidth: 10.0
+    adrc_b0: 1.0
+```
+
+---
+
+## 18. MuJoCo Actuator 模式的必要修改
+
+当前所有机器人的 XML 使用 **position actuator**。如果用 `pre_step_control` 做 CTC/ADRC，力矩已经被 Python 层计算好了，**MuJoCo 不应该再做一次 PD**。
+
+### 18.1 方案：将 position actuator 替换为 motor actuator
+
+```xml
+<!-- go2.xml — 当前 -->
+<position class="abduction" name="FR_hip" joint="FR_hip_joint"/>
+
+<!-- go2.xml — 修改后 -->
+<motor class="abduction" name="FR_hip" joint="FR_hip_joint"/>
+```
+
+### 18.2 向后兼容：保留 `controller_type: "pd"` 的场景
+
+当 `controller_type == "pd"` 时，仍然使用 position actuator + 不设置 `pre_step_control`，行为与现有完全一致。
+
+当 `controller_type != "pd"` 时，需要使用 motor actuator 变体。**推荐运行时修改 `model.actuator_biastype[:] = 0`**，在 init 阶段把 position 改为 motor——无需维护额外 XML，且 MuJoCo 允许运行时修改。
+
+---
+
+## 19. Pinocchio 与 MuJoCo 的状态对齐
+
+Pinocchio 独立计算动力学，但输入（q, q̇）来自 MuJoCo backend。需要注意：
+
+### 19.1 坐标系对齐
+
+| 量 | MuJoCo | Pinocchio | 对齐方式 |
+|----|--------|-----------|---------|
+| 关节位置 q | `data.qpos` — free joint 用 7D (pos+quat) | `q` — floating base 用 7D (quat+pos) 或 6D (SE3) | **四元数顺序不同**：MuJoCo `wxyz`，Pinocchio `xyzw` |
+| 关节速度 v | `data.qvel` — free joint 用 6D (3 lin + 3 ang) | `v` — body velocity 6D | 顺序和参考系需确认 |
+| 质量矩阵 M | `mj_fullM` | `pinocchio.crba(q)` | 需要验证在相同 q 下数值一致 |
+| Coriolis + 重力 | `data.qfrc_bias` | `pinocchio.rnea(q, v, 0)` | 应该一致 |
+
+### 19.2 关节顺序对齐与 `PinocchioDynamicsModel` 封装
+
+MuJoCo 和 Pinocchio 的关节顺序可能不同。需要一个**关节映射表**：
+
+```python
+class PinocchioDynamicsModel:
+    """封装 Pinocchio 模型，处理与 MuJoCo backend 的状态对齐。"""
+
+    def __init__(self, mjcf_or_urdf_path: str, backend: SimBackend):
+        self._model = pin.buildModelFromMjcf(mjcf_or_urdf_path)  # 或 buildModelFromURDF
+        self._data = self._model.createData()
+        self._build_joint_mapping(backend)
+
+    def _build_joint_mapping(self, backend):
+        """建立 MuJoCo → Pinocchio 关节索引映射。"""
+        ...
+
+    def compute_dynamics(self, qpos: np.ndarray, qvel: np.ndarray):
+        """从 MuJoCo 状态计算 Pinocchio 动力学量。"""
+        q_pin = self._mj_to_pin_qpos(qpos)   # 坐标变换
+        v_pin = self._mj_to_pin_qvel(qvel)
+        M = pin.crba(self._model, self._data, q_pin)     # 质量矩阵
+        bias = pin.rnea(self._model, self._data, q_pin, v_pin, np.zeros_like(v_pin))  # c+g
+        return M, bias
+```
+
+---
+
+## 20. 自抗扰 (ADRC) 在此架构下的实现要点
+
+### 20.1 ADRC 的核心结构
+
+```
+                    ┌──────────┐
+  q_d (target) ──▶│  TD      │──▶ v_1 (过渡过程)
+                    │ 跟踪微分器 │──▶ v_2 (过渡微分)
+                    └──────────┘
+                          │
+                    ┌─────▼──────┐
+  q, q̇ ──────────▶│   ESO      │──▶ z_1 (q 估计)
+                    │ 扩张状态观测器│──▶ z_2 (q̇ 估计)
+                    │            │──▶ z_3 (扰动估计) ← 核心创新
+                    └────────────┘
+                          │
+                    ┌─────▼──────┐
+                    │  NLSEF     │──▶ u_0 (误差控制量)
+                    │ 非线性状态误差│
+                    │   反馈律    │
+                    └────────────┘
+                          │
+                    ┌─────▼──────────────────────┐
+                    │  动力学补偿                 │
+                    │  τ = M(q)*(u_0 - z_3/b0) + c(q,q̇) + g(q) │
+                    └─────────────────────────────┘
+```
+
+### 20.2 ESO 的 per-env 状态管理
+
+ESO 维护 per-env 内部状态（z_1, z_2, z_3），需要在 `reset()` 时清零：
+
+```python
+class ADRCController(MotorController):
+    def __init__(self, model, kp, kd, eso_bw, b0, num_envs, nu):
+        ...
+        self._eso_z = np.zeros((num_envs, 3, nu))  # (num_envs, 3 states, nu)
+        # z[:, 0] = z_1 (q 估计), z[:, 1] = z_2 (q̇ 估计), z[:, 2] = z_3 (扰动估计)
+
+    def compute_torque(self, backend, target, dof_pos, dof_vel):
+        dt = backend._sim_dt
+        w = self._eso_bandwidth
+
+        # ESO 更新 (线性 ESO, 三阶)
+        e = dof_pos - self._eso_z[:, 0]
+        self._eso_z[:, 0] += dt * (self._eso_z[:, 1] + 3*w*e)
+        self._eso_z[:, 1] += dt * (self._eso_z[:, 2] + 3*w**2*e)
+        self._eso_z[:, 2] += dt * (w**3*e)
+
+        # 误差反馈
+        e1 = target - self._eso_z[:, 0]      # 位置误差
+        e2 = 0.0 - self._eso_z[:, 1]         # 速度误差（目标速度 = 0，或从 TD 获取）
+        u0 = self._kp * e1 + self._kd * e2
+
+        # 动力学补偿 + 扰动补偿
+        M, bias = self._pin_model.compute_dynamics(...)
+        tau = M @ (u0 - self._eso_z[:, 2] / self._b0) + bias
+
+        return tau
+
+    def reset(self, env_ids):
+        self._eso_z[env_ids] = 0.0
+```
+
+### 20.3 ADRC 降低 sim2real gap 的机理
+
+| 来源 | PD 无法处理 | ADRC 如何处理 |
+|------|------------|--------------|
+| 未建模摩擦 | 产生稳态误差 | ESO 估计为扰动 z_3，前馈补偿 |
+| 负载变化 | Kp/Kd 不匹配 → 超调/振荡 | ESO 自适应估计等效质量变化 |
+| 外部扰动（推力） | 无抵抗力 | z_3 实时估计并补偿 |
+| 关节柔性 | 模型不匹配 | ESO 将柔性效应纳入扰动估计 |
+| 电机饱和 | PD 积分饱和 | ADRC 无积分项，天然抗饱和 |
+
+---
+
+## 21. 性能考量
+
+### 21.1 Pinocchio 的计算开销
+
+| 操作 | 典型耗时 (Go2, 12 DoF) | 备注 |
+|------|----------------------|------|
+| `pin.crba(q)` (质量矩阵) | ~10-30 μs | 可优化为稀疏 Cholesky |
+| `pin.rnea(q, v, a)` (逆动力学) | ~5-15 μs | |
+| ESO 更新 (12 joints) | ~2-5 μs | 纯 numpy 运算 |
+| **总增量** | **~20-50 μs / env / step** | |
+
+对比 MuJoCo 一个 substep 约 100-500 μs，Pinocchio 开销约 5-10%。
+
+### 21.2 向量化：多 env 的批量计算
+
+当前 `num_envs` 通常为 2048-4096。Pinocchio 的 `crba`/`rnea` 是单 env 计算的。
+
+**优化策略**：
+
+1. **批量循环**：对每个 env 独立调用 Pinocchio。优点：实现简单。缺点：Python 循环开销（4096 次 × 20μs ≈ 80ms，太慢）
+2. **提取动力学参数，批量 numpy 计算**（推荐）：初始化时从 Pinocchio 提取 `model.inertias`、`model.jointPlacements` 等，每步用 numpy 批量计算 M(q) 和 bias(q, q̇)。关节链较短（如四足 12 DoF）时，可手动展开 RNEA 递推公式
+3. **Pinocchio batch API**（Pinocchio 3.x）：有限支持批量，需要确认是否支持 (num_envs, nv) 形状的批量输入
+
+**推荐**：初期用策略 1 验证正确性，后续优化用策略 2。
+
+---
+
+## 22. 实施路线图
+
+### Phase 0：前置准备
+- [ ] 确认 Pinocchio 3.x 的 MJCF 加载能力，若不支持则获取/编写 URDF
+- [ ] 验证 Pinocchio 计算的动力学量与 MuJoCo 在相同状态下的数值一致性
+- [ ] 将 `pinocchio` 加入 `pyproject.toml` 依赖
+
+### Phase 1：控制器抽象层
+- [ ] 创建 `src/unilab/control/` 模块
+- [ ] 实现 `MotorController` 抽象基类
+- [ ] 实现 `PDController`（与现有行为等价）
+- [ ] 在 `ControlConfig` 中添加 `controller_type` 字段
+- [ ] 选一个 env（如 Go2 Joystick Flat）作为试点
+
+### Phase 2：Pinocchio 动力学模型
+- [ ] 实现 `PinocchioDynamicsModel`（封装 Pinocchio 模型 + MuJoCo 状态对齐）
+- [ ] 实现 `CTCController`（计算力矩控制）
+- [ ] 验证 CTC 在仿真中的跟踪性能
+
+### Phase 3：ADRC 控制器
+- [ ] 实现 `ADRCController`（含 ESO）
+- [ ] 验证 ESO 的扰动估计能力（引入外部扰动测试）
+- [ ] 对比 PD / CTC / ADRC 的 sim2real gap
+
+### Phase 4：Actuator 模式切换
+- [ ] 实现运行时 position → motor actuator 切换
+- [ ] 确保所有现有 env 在 `controller_type: "pd"` 时行为不变
+- [ ] 在 CI 中添加控制器切换的集成测试
+
+### Phase 5：扩展到更多机器人和后端
+- [ ] G1 人形机器人 CTC / ADRC
+- [ ] Go2W 轮腿混合控制器
+- [ ] Motrix 后端的 `pre_step_control` 对接
+
+---
+
+## 23. 关键风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|------|------|------|
+| Pinocchio MJCF 加载不完整 | 需要额外维护 URDF | 先验证；若失败，用 `unilab-import-robot` 的反向流程 |
+| 四元数顺序不一致 (MuJoCo wxyz vs Pinocchio xyzw) | 动力学计算错误 | `PinocchioDynamicsModel` 中做自动转换 |
+| Pinocchio 批量计算性能不足 | 训练速度下降 | 先用循环验证，再优化为手动批量 RNEA |
+| Position → Motor actuator 切换影响仿真稳定性 | 仿真发散 | 保留 `controller_type: "pd"` 作为 fallback |
+| ADRC 参数 (eso_bandwidth, b0) 敏感 | 控制器不稳定 | 在仿真中系统性扫描参数空间 |
+
+---
+
+## 附录 A：关键文件速查
 
 | 用途 | 路径 |
 |------|------|
@@ -671,10 +1084,27 @@ docs/
 | 结构化配置 | `src/unilab/structured_configs.py` |
 | 异步 Runner | `src/unilab/ipc/async_runner.py` |
 | DR Manager | `src/unilab/dr/manager.py` |
-| 旋转工具 | `src/unilab/envs/common/rotation.py` |
-| 数学工具 | `src/unilab/envs/common/math.py` |
-| MLX 旋转 | `src/unilab/algos/mlx/common/rotation.py` |
 | 可视化 | `src/unilab/visualization/` |
-| 开发指南 | `docs/sphinx/source/zh_CN/4-developer_guide/0-index.md` |
-| 贡献流程 | `docs/sphinx/source/zh_CN/4-developer_guide/5-contributing_workflow.md` |
-| ADR | `docs/sphinx/source/adr/` |
+
+## 附录 B：控制器相关文件速查
+
+| 用途 | 文件路径 |
+|------|---------|
+| 基类 apply_action | `src/unilab/envs/locomotion/common/base.py` |
+| ControlConfigBase / PdControlConfig | `src/unilab/envs/locomotion/common/base.py:23-33` |
+| SimBackend pre_step_control 接口 | `src/unilab/base/backend/base.py:247-265` |
+| MuJoCo _step_with_pre_step_control | `src/unilab/base/backend/mujoco/backend.py:819-863` |
+| MuJoCo position_actuator_gains 注入 | `src/unilab/base/backend/mujoco/backend.py:166-178` |
+| Go2W 显式 PD (pre_step_control 示例) | `src/unilab/envs/locomotion/go2w/base.py:93-116` |
+| Go2W 注册 pre_step_control | `src/unilab/envs/locomotion/go2w/joystick.py:273` |
+| Go2W _pre_step_motor_control | `src/unilab/envs/locomotion/go2w/joystick.py:391-405` |
+| NpEnv.step() 控制流 | `src/unilab/base/np_env.py:104-166` |
+| DR 中 kp/kd 随机化 | `src/unilab/dr/dr_utils.py:151-160` |
+| Motrix position_actuator kp/kd 覆盖 | `src/unilab/base/backend/motrix/backend.py:1385-1399` |
+| Go2 Rough _estimate_pd_torques (reward) | `src/unilab/envs/locomotion/go2/rough.py:523-539` |
+| Footstand _estimate_pd_torques (reward) | `src/unilab/envs/locomotion/go2/footstand.py:659-666` |
+| Sharpa torque_control 声明 | `src/unilab/envs/manipulation/sharpa_inhand/base.py:88` |
+| create_backend position_actuator_gains | `src/unilab/base/backend/__init__.py:38-78` |
+| Go2 Arm 分段增益 | `src/unilab/envs/locomotion/go2_arm/base.py:141` |
+| Go2 XML actuator 定义 | `src/unilab/assets/robots/go2/go2.xml:188-201` |
+| G1 XML actuator 定义 | `src/unilab/assets/robots/g1/g1.xml:328-361` |
