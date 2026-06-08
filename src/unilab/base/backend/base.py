@@ -200,6 +200,24 @@ class SimBackend(abc.ABC):
         """Return the backend dof-armature table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose dof armature")
 
+    def get_full_qpos(self) -> np.ndarray:
+        """Return full generalized positions including the floating base.
+
+        Returns:
+            Array with shape ``(num_envs, nq)`` where ``nq`` includes the
+            floating-base quaternion (7 components) plus all joint positions.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose full qpos")
+
+    def get_full_qvel(self) -> np.ndarray:
+        """Return full generalized velocities including the floating base.
+
+        Returns:
+            Array with shape ``(num_envs, nv)`` where ``nv`` includes the
+            floating-base velocity (6 components) plus all joint velocities.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose full qvel")
+
     def get_motion_body_ids(self, names: Sequence[str]) -> np.ndarray:
         """Resolve MuJoCo-style body IDs used by motion datasets."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose motion body ids")

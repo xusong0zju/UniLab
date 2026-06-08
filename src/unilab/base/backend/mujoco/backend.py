@@ -1062,6 +1062,20 @@ class MuJoCoBackend(SimBackend):
     def get_dof_vel(self) -> np.ndarray:
         return self._dof_vel_view
 
+    def get_full_qpos(self) -> np.ndarray:
+        """Return full generalized positions including the floating base.
+
+        Shape: ``(num_envs, nq)`` where nq = 7 (base) + num_actuated_joints.
+        """
+        return self._qpos_view
+
+    def get_full_qvel(self) -> np.ndarray:
+        """Return full generalized velocities including the floating base.
+
+        Shape: ``(num_envs, nv)`` where nv = 6 (base) + num_actuated_dofs.
+        """
+        return self._physics_state[:, self._idx_qvel : self._idx_qvel + self.nv]
+
     # ------------------------------------------------------------------ #
     # Body kinematics — world frame                                      #
     # ------------------------------------------------------------------ #
