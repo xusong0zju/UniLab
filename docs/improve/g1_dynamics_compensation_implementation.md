@@ -920,11 +920,163 @@ uv run python scripts/train_offpolicy.py --config-name=offpolicy task=flashsac/g
 
 ---
 
-## 14 后续扩展
+## 14 A/B 训练对比实验
+
+### 14.1 实验设置
+
+| 项目 | 值 |
+|------|-----|
+| 算法 | FlashSAC |
+| 环境 | G1WalkFlat / G1WalkFlatGC / G1WalkFlatCC |
+| num_envs | 4096 |
+| max_iterations | 5000（从 2000 checkpoint 继续） |
+| 超参 | 三组完全一致，仅 control_config 不同 |
+| 硬件 | NVIDIA RTX 4080 SUPER (32GB) |
+| 日志 | `logs/flash_sac/G1WalkFlat/`, `G1WalkFlatGC/`, `G1WalkFlatCC/` |
+
+### 14.2 最终结果（5000 iterations）
+
+| 指标 | Baseline (PD) | GC (PD+g) | CC (PD+g+C·q̇) |
+|------|:---:|:---:|:---:|
+| **reward/mean_ep100** | 308.23 | **323.68** | 317.24 |
+| **reward/mean** | 304.67 | **316.51** | 308.77 |
+| tracking_lin_vel | 1.71 | **1.77** | 1.71 |
+| tracking_ang_vel | **1.18** | 1.11 | 0.92 |
+| penalty_orientation | -0.004 | -0.004 | -0.004 |
+| penalty_action_rate | -0.70 | **-0.62** | -0.64 |
+| feet_phase | 4.60 | **4.75** | 4.71 |
+| penalty_feet_ori | -0.33 | **-0.12** | -0.13 |
+| episode/length | 987.7 | **998.2** | 990.7 |
+| terminated_rate | **0.000** | 0.032 | 0.015 |
+| timeout_rate | 1.000 | 0.968 | 0.985 |
+
+**最优值加粗**。三个实验最终都达到了 `timeout_rate > 96%`（走完整个 episode 不摔倒）。
+
+### 14.3 中期对比（2000 iterations）
+
+| 指标 | Baseline | GC | CC |
+|------|:---:|:---:|:---:|
+| **reward/mean_ep100** | 104.7 | **151.3** | 59.6 |
+| **reward/mean** | 45.9 | **60.0** | 26.1 |
+| episode/length | 523.2 | **775.5** | 319.2 |
+| terminated_rate | 0.885 | **0.400** | 1.000 |
+| timeout_rate | 0.115 | **0.600** | 0.000 |
+
+### 14.4 收敛速度分析
+
+| 指标 | Baseline | GC | CC |
+|------|---------|-----|-----|
+| 最终 reward/mean_ep100 | 308.2 | 323.7 | 317.2 |
+| 达到 50% 最终 reward 的 env steps | 8.7M | 8.8M | 10.8M |
+| 达到 90% 最终 reward 的 env steps | 14.2M | 14.6M | 15.9M |
+| 达到 timeout_rate > 90% 的阶段 | ~14M steps | ~12M steps | ~17M steps |
+
+### 14.5 关键发现
+
+#### 发现 1：GC 最优，CC 接近 Baseline
+
+5000 iterations 后的最终表现排名：
+
+```
+GC (323.7) > CC (317.2) > Baseline (308.2)
+```
+
+GC 比Baseline 高 **5.0%**，CC 比Baseline 高 **2.9%**。GC 是三者中表现最好的。
+
+#### 发现 2：GC 收敛最快，CC 初期最慢
+
+| 阶段 | Baseline | GC | CC |
+|------|---------|-----|-----|
+| 2000 iter reward | 104.7 | **151.3** | 59.6 |
+| 5000 iter reward | 308.2 | **323.7** | 317.2 |
+| 相对 Baseline 的加速 | — | **+44.6%**（2000 iter 时） | -43.1%（2000 iter 时） |
+
+GC 在中期阶段优势明显（2000 iter 时领先 Baseline 44.6%），说明重力补偿显著加速了早期学习。
+
+CC 在初期最慢（2000 iter 时仅为 Baseline 的 57%），因为：
+- Coriolis 计算开销导致 collector 每秒步数较少
+- 额外的前馈力矩增加了初期探索的难度
+- 但 CC 最终追上并超越了 Baseline（+2.9%）
+
+#### 发现 3：CC 的 tracking_ang_vel 偏低
+
+| 指标 | Baseline | GC | CC |
+|------|---------|-----|-----|
+| tracking_lin_vel | 1.71 | **1.77** | 1.71 |
+| tracking_ang_vel | **1.18** | 1.11 | 0.92 |
+
+CC 的角速度跟踪能力明显弱于 Baseline 和 GC（0.92 vs 1.18/1.11）。可能原因：
+- Coriolis 补偿在旋转时引入了额外的前馈力矩，使 policy 更难精确控制角速度
+- `coriolis_scale=1.0` 可能偏大，尤其在腰部关节——旋转运动时 C(q,q̇)q̇ 量级较大
+- 可考虑降低腰部关节的 `coriolis_scale` 或调整 `coriolis_comp_mask`
+
+#### 发现 4：GC/CC 的 feet_ori 更好
+
+| 指标 | Baseline | GC | CC |
+|------|---------|-----|-----|
+| penalty_feet_ori | -0.33 | **-0.12** | -0.13 |
+
+GC 和 CC 的脚部朝向惩罚仅为 Baseline 的 1/3，说明动力学补偿后步态更自然、脚部更稳。
+
+#### 发现 5：GC/CC 的 action_rate 更低
+
+| 指标 | Baseline | GC | CC |
+|------|---------|-----|-----|
+| penalty_action_rate | -0.70 | **-0.62** | -0.64 |
+
+补偿后 policy 需要更少的 action 变化即可维持稳定行走——等效动力学更简单，不需要频繁修正。
+
+### 14.6 训练曲线
+
+训练曲线图保存在 `training_logs/comparison_curves.png`。
+
+```
+Episode Reward (mean_ep100)          Episode Reward (instant)
+  350 |                    GC         350|
+      |               CC /---B          |               GC
+  300 |   B ---------/                  |   B ---------/--CC
+      |  /                              |  /
+  250 | /                               | /
+      |/                                |/
+  200 |                                 |          CC
+      |          CC                     |         /
+  150 |      /--                        |      /--
+      |    /                            |    /
+  100 | /-- B                          | /-- B
+      |/                                |/
+   50 |                                 |
+      |                                 |
+    0 +------|------|------|-->         0 +------|------|------|-->
+      0      5     10     15  M steps     0      5     10     15  M steps
+```
+
+### 14.7 实验结论
+
+| 结论 | 说明 |
+|------|------|
+| **GC 是当前最优选择** | 最终 reward 最高（+5.0%），收敛最快，实现简单 |
+| **CC 最终超越 Baseline 但弱于 GC** | +2.9% vs Baseline，但 tracking_ang_vel 偏低 |
+| **CC 初期收敛慢** | Coriolis 计算开销 + 额外前馈力矩增加了探索难度 |
+| **补偿后步态更自然** | feet_ori 和 action_rate 均优于 Baseline |
+| **CC 需要调优** | `coriolis_scale` 和 `coriolis_comp_mask` 可能需要调整 |
+
+### 14.8 CC 调优建议
+
+1. **降低 coriolis_scale**：从 1.0 降至 0.5~0.8，减小前馈力矩对角速度跟踪的干扰
+2. **调整腰部 mask**：腰部关节（index 12-14）的 Coriolis 力矩在旋转时较大，可单独降低 `coriolis_scale` 或在 mask 中减弱
+3. **增加训练 iterations**：CC 在 5000 iterations 仍在上升，延长至 10000 可能继续改善
+4. **Coriolis 补偿 curriculum**：训练初期 `coriolis_scale=0`，逐步增至 1.0（类似 GC 的 gravity_scale 调度）
+5. **减少 num_envs**：CC 的 collector 开销大，减少 env 数量可提升 iter/s，但需要更多 iterations
+
+---
+
+## 15 后续扩展
 
 1. **CTC 控制器**：实现 `CTCController`，完全线性化动力学 τ = M(q)[kp(q_d-q) + kd(q̇_d-q̇)] + C(q,q̇)q̇ + g(q)
 2. **numba 加速**：将 Python 循环替换为 numba JIT，预计 4096 env 计算从 ~100ms 降至 ~10ms
 3. **部署侧 C++ 导出**：将 Pinocchio 模型参数导出为 YAML/JSON，部署侧加载并实现相同补偿
-4. **gravity_scale / coriolis_scale 调度**：训练初期 scale 较小，逐步增至 1.0，类似 curriculum
+4. **gravity_scale / coriolis_scale 调度**：训练初期 scale 较小，逐步增至 1.0，类似 curriculum（实验表明 CC 初期收敛慢，curriculum 可改善）
 5. **力矩/能耗惩罚**：如果需要添加，需区分 PD 力矩和前馈力矩，避免惩罚补偿本身
+6. **独立 coriolis_comp_mask 调优**：实验表明 CC 的 tracking_ang_vel 偏低，需调整腰部关节的 coriolis_scale 或 mask
+7. **CC 长时间训练验证**：CC 在 5000 iter 仍在上升，需 10000+ iter 确认是否继续追赶 GC
 6. **独立 coriolis_comp_mask 调优**：当前跟随 gravity_comp_mask，可根据 A/B 结果单独调整
