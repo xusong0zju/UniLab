@@ -1,6 +1,7 @@
 """Motor controller abstractions and implementations for dynamics compensation."""
 
 from unilab.control.base import MotorController
+from unilab.control.coriolis_comp_controller import CoriolisCompController
 from unilab.control.pd_controller import PDController
 from unilab.control.gravity_comp_controller import GravityCompController
 from unilab.control.ctc_controller import CTCController
@@ -12,6 +13,7 @@ __all__ = [
     "MotorController",
     "PDController",
     "GravityCompController",
+    "CoriolisCompController",
     "CTCController",
     "PinocchioDynamicsModel",
     "switch_to_motor_actuators",
