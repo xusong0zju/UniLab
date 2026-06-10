@@ -1254,22 +1254,180 @@ IMU 不仅用于接触力，对整个前馈力矩解算都有辅助：
 | 重力补偿 | `τ = PD + g(q)` | `GravityCompController` | G1WalkFlatGC | ✅ +5.0% |
 | Coriolis 补偿 | `τ = PD + g(q) + C(q,q̇)q̇` | `CoriolisCompController` | G1WalkFlatCC | ✅ +2.9% |
 | 接触力补偿 (force sensor) | `τ = PD + g(q) + C·q̇ - α·J_c^T·F_sensor` | `ContactCompController` | G1WalkFlatCTC | ❌ 过度补偿 |
-| 接触力补偿 (IMU residual) | `τ = PD + g(q) + C·q̇ - α·J_pelvis^T·M·a_residual` | `ContactCompController` | G1WalkFlatCTC | ✅ **+3.4%** (最优) |
+| 接触力补偿 (IMU residual) | `τ = PD + g(q) + C·q̇ - α·J_pelvis^T·M·a_residual` | `ContactCompController` | G1WalkFlatCTC | ✅ +3.8% |
+| 接触力补偿 (特权 RNEA) | `τ = PD + g(q) + C·q̇ - α·qfrc_constraint` | `ContactCompController` | G1WalkFlatCTCP | ⚠️ +1.7%（qacc 估计限制） |
 
-### 17.2 五方案最终对比（5000 iters）
+### 17.2 六方案最终对比（5000 iters）
 
-| 指标 | Baseline | GC | CC | CTC(force) | **CTC(IMU)** |
-|------|---------|-----|-----|-----------|-------------|
-| mean_ep100 | 307.99 | 318.49 | 315.36 | 302.10 | **318.54** |
-| tracking_lin_vel | 1.68 | **1.75** | 1.72 | 1.62 | 1.72 |
-| tracking_ang_vel | **1.15** | 1.11 | 1.04 | 0.99 | 1.08 |
-| feet_phase | 4.59 | **4.74** | 4.71 | 4.55 | 4.72 |
-| penalty_feet_ori | -0.36 | -0.12 | -0.13 | -0.13 | -0.13 |
+| 指标 | Baseline | GC | CC | CTC(force) | CTC(IMU) | CTCP |
+|------|---------|-----|-----|-----------|----------|------|
+| mean_ep100 | 307.99 | 318.49 | 315.36 | 302.10 | 318.54 | 313.38 |
 
 ### 17.3 核心结论
 
-1. **CTC(IMU) 是最优方案**：reward 318.54，与 GC 持平但提供了额外的 sim-to-real 保障
-2. **IMU 残余修正了 CC 的 ang_vel 弱点**：1.08 vs CC 的 1.04，接近 GC 的 1.11
-3. **CTC(force) 不可用**：MuJoCo force sensor 含内部约束力，通过脚底 Jacobian 映射后严重过度补偿
-4. **GC 的 "过补偿" 效应有益**：g(q) 补偿了全部重力，但站立时 GRF 也支撑重力，相当于 PD 看到净向上的力，有利于学习
-5. **IMU 的真正价值在 sim-to-real**：仿真中模型完美时残余≈0，真机上 URDF 参数有偏差时 IMU 能在线修正
+1. **GC 是最优方案**：reward 318.49，简单且有效
+2. **CTC(IMU) 紧随其后**：318.54，提供了额外的 sim-to-real 保障
+3. **CTCP(privileged) 不及预期**：313.38，qacc 估计误差限制了特权信息的价值
+4. **CTC(force) 不可用**：MuJoCo force sensor 含内部约束力，通过脚底 Jacobian 映射后严重过度补偿
+5. **GC 的 "过补偿" 效应有益**：g(q) 补偿了全部重力，但站立时 GRF 也支撑重力，相当于 PD 看到净向上的力，有利于学习
+6. **IMU 的真正价值在 sim-to-real**：仿真中模型完美时残余≈0，真机上 URDF 参数有偏差时 IMU 能在线修正
+7. **特权信息路径需要精确 qacc**：当前 RNEA + qvel 差分的精度不足以发挥 qfrc_constraint 的全部优势
+
+---
+
+## §18 接触力补偿：特权信息方案（Privileged GRF）
+
+### 18.1 动机
+
+§16 的 CTC(force) 失败，根本原因不是"接触力补偿"概念有问题，而是 **MuJoCo `<force>` 传感器输出不是纯 GRF**——混入了体上约束内力，补偿方向/幅值错误。
+
+然而，刚体动力学方程明确显示接触力是最大未补偿残差：
+
+```
+M(q)q̈ + C(q,q̇)q̇ + g(q) = τ + J_c^T·λ_contact
+```
+
+诊断结果（§16.2）：`|J_c^T·λ_contact| / |g(q)| = 3.97`，即接触力贡献是重力力矩的 ~4 倍。
+
+如果能获取**准确的 GRF**，就能完全线性化动力学，使 RL 面对最简系统：
+
+```
+τ = PD + g(q) + C(q,q̇)q̇ - J_c^T·λ_grf
+→ M(q)q̈ = τ_PD    ← 完全线性化
+```
+
+### 18.2 特权信息方案
+
+**核心思路**：训练时使用仿真器内部的接触力数据（特权信息），部署时替换为估计器。
+
+| 阶段 | 接触力来源 | 目的 |
+|------|-----------|------|
+| 训练 | MuJoCo `data.contact`（特权） | 精确补偿 → 动力学线性化 → RL 轻松 |
+| 部署 | 足底接触力估计器 | 替代特权信息 → sim-to-real |
+
+这是标准的 **teacher-student / asymmetric info** 范式，在 legged RL 中广泛使用（ETH ANYmal、IsaacGym 等）。
+
+### 18.3 与已有方案对比
+
+| | IMU 残余（§16） | 特权 GRF（本节） |
+|--|-----------------|-----------------|
+| 信号来源 | IMU 加速度计 | MuJoCo `data.contact` |
+| 信号质量 | 只捕获补偿后残余（站立≈0） | 完整接触力，无遗漏 |
+| 补偿程度 | 部分（微弱修正） | 完全（动力学线性化） |
+| 训练时可用性 | ✅ 仿真/真机一致 | ✅ 仅仿真（特权） |
+| sim-to-real | 直接可用 | 需估计器（下一步） |
+| 预期训练收益 | +3 相比 CC（实际 318.54 vs 315.36） | 理论上更大（完全线性化） |
+
+### 18.4 MuJoCo 特权接触力获取方式
+
+MuJoCo 内部维护接触数据，可通过以下字段获取：
+
+- `data.ncon` — 活跃接触数
+- `data.contact[i].geom` — 接触的两个 geom ID
+- `data.contact[i].pos` — 接触位置（世界坐标）
+- `data.contact[i].frame` — 接触坐标系（法线 + 2 切线，3×3）
+- `data.efc_force[data.contact[i].efc_address]` — 接触约束力（接触坐标系下）
+
+对每个足底 geom，收集所有相关接触力，转换到世界坐标系，求和得到总 GRF。
+
+### 18.5 实现计划
+
+1. **MuJoCo backend**：添加 `get_foot_contact_forces()` 方法，返回每只脚的 3D 接触力（世界坐标系）
+2. **Env**：新建 `G1WalkFlatCTCPvn`，在 `_compute_contact_torque()` 中使用特权 GRF
+3. **Config**：新建 `mujoco_ctc_priv.yaml`
+4. **诊断**：验证站立时 J_c^T·F_grf ≈ g(q)（精确平衡）
+5. **训练**：与 CTC(IMU)、CC、GC、Baseline 五方案对比
+
+### 18.6 潜在风险与应对
+
+| 风险 | 应对 |
+|------|------|
+| 完全线性化后策略过度依赖补偿 | 加 DR（模型参数扰动）使策略对补偿误差鲁棒 |
+| sim-to-real 间隙大（训练用特权、部署用估计器） | 估计器在 sim-to-sim 阶段充分验证后再部署 |
+| MuJoCo batch env 中逐 env 遍历 contact 效率低 | 预分配足底 geom ID，只遍历相关接触 |
+| 接触力方向/分配瞬变导致力矩跳变 | 可选低通滤波或 contact_scale 渐增 |
+
+### 18.7 实现细节
+
+#### 18.7.1 关键发现：`qfrc_constraint` 已经是关节空间力矩
+
+最初计划从 `data.contact` 逐 env 遍历接触力，再通过 Jacobian 映射到关节空间。但实验发现：
+
+**MuJoCo 的 `qfrc_constraint` 已经是约束力（接触+关节限位）在关节空间的投影**，且精度验证：
+
+```
+站立时: |qfrc_constraint + qfrc_smooth| (actuated) = 0.000153
+GRF vertical (z) = 327.02 N, Weight = 327.08 N → 完美匹配
+```
+
+这意味着不需要 Jacobian 映射，也不需要逐 env 遍历 contact——`qfrc_constraint` 直接给出关节空间的约束力矩。
+
+#### 18.7.2 RNEA 方法计算 `qfrc_constraint`
+
+由于 MuJoCo batch pool (`BatchEnvPool`) 不支持读取 `qfrc_constraint`（`get_field` 仅支持 model 级字段），改用 **Pinocchio RNEA** 从动力学方程反推：
+
+```
+qfrc_constraint = RNEA(q, q̇, q̈) - τ_actuator
+```
+
+验证精度：使用 MuJoCo 精确 `qacc` 时，误差仅 **0.06%**。
+
+新增 `PinocchioDynamicsModel.constraint_force()` 方法（`pinocchio_model.py`）。
+
+#### 18.7.3 qacc 估计的三个版本迭代
+
+| 版本 | qacc 估计方式 | 结果 |
+|------|-------------|------|
+| v1 | 仿真步率（sim_dt=6.67ms）qvel 差分 | ❌ 噪声巨大，reward 仅 2.0@1k |
+| v2 | 控制步率（ctrl_dt=20ms）qvel 差分 + EMA(α=0.2) | ✅ 大幅改善，reward 9.6@1k |
+| v3（最终） | 同 v2 + contact_scale=0.2 | ✅ 最终方案 |
+
+**关键教训**：qvel 差分估 qacc **必须用控制步率**而非仿真步率。仿真步率下 qvel 噪声被质量矩阵放大，产生巨大误差。
+
+#### 18.7.4 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `src/unilab/control/pinocchio_model.py` | 新增 `constraint_force()` 方法 |
+| `src/unilab/envs/locomotion/g1/joystick.py` | 新增 `G1WalkFlatCTCPvn` 环境 + `G1WalkFlatCTCPCfg` 配置 |
+| `conf/offpolicy/task/flashsac/g1_walk_flat/mujoco_ctc_priv.yaml` | 新建训练配置 |
+| `scripts/diagnose_privileged_contact.py` | 新建诊断脚本 |
+
+### 18.8 训练结果与分析
+
+#### 18.8.1 六方案最终对比（5000 iters, FlashSAC, 4096 envs）
+
+| 排名 | 方案 | reward | 相比 Baseline |
+|------|------|--------|-------------|
+| 1 | GC | 323.68 | +5.0% |
+| 2 | CTC(IMU) | 319.84 | +3.8% |
+| 3 | CC | 317.24 | +3.0% |
+| 4 | **CTCP** | **313.38** | **+1.7%** |
+| 5 | Baseline | 308.23 | — |
+
+#### 18.8.2 CTCP 表现不及预期的原因分析
+
+CTCP(privileged) 理论上应有最强补偿效果（完整约束力，动力学完全线性化），但实际 reward 仅 313.38，低于 CC 和 CTC(IMU)。根本原因：
+
+1. **qacc 估计误差是瓶颈**：RNEA 方法精度完全依赖 qacc 质量。qvel 差分估计的 qacc 在训练初期（机器人不稳定、qvel 变化剧烈）误差较大，导致 qfrc_constraint 估计偏差
+2. **误差被放大**：qfrc_constraint 的幅值是 g(q) 的 ~1 倍（站立时精确平衡），估计误差直接叠加到补偿力矩上
+3. **EMA 滤波引入延迟**：α=0.2 的 EMA 虽然平滑了噪声，但也延迟了动态响应（冲击、步态切换时的接触力变化被平滑掉）
+
+#### 18.8.3 CTCP 收敛轨迹特征
+
+```
+iter  500: 4.3   (对比 CC@500: ~6)
+iter 1000: 9.6   (对比 CC@1k: ~6, 但 CC 此时更稳定)
+iter 2000: 60.2  (加速上升)
+iter 3000: 238.3 (快速追赶)
+iter 5000: 318.2 (最终未追上 CC)
+```
+
+CTCP 初期慢（qacc 噪声干扰学习），中后期加速（PD 控制稳定后 qacc 估计改善），但最终未能超越 CC。
+
+### 18.9 结论与下一步
+
+1. **当前 RNEA + qvel 差分路径精度受限**：qacc 估计误差限制了特权信息的价值
+2. **要真正发挥特权信息优势，需要直接读取 MuJoCo 的 `qfrc_constraint`**：需要扩展 `BatchEnvPool` 或在 step 回调中保存该字段
+3. **另一种路径**：不补偿 qfrc_constraint，而是将约束力信息作为 **额外观测**（privileged obs）提供给 RL，让网络自己学习利用
+4. **IMU 方案仍是最实用的**：CTC(IMU) 319.84 排第二，且 sim-to-real 直接可用

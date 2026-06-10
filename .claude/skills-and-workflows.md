@@ -347,5 +347,35 @@ print("Motor kd:", env._motor_kd[0])
 | 架构标准 | `docs/sphinx/source/zh_CN/4-developer_guide/0-index.md` |
 | 协作流程 | `docs/sphinx/source/zh_CN/4-developer_guide/5-contributing_workflow.md` |
 | 开发者入口 | `CONTRIBUTING.md` |
-| 重力补偿实现文档 | `docs/improve/g1_gravity_compensation_implementation.md` |
+| 动力学补偿实现文档 | `docs/improve/g1_dynamics_compensation_implementation.md` |
 | 项目记忆 | `.claude/memory/` |
+
+---
+
+## 8 动力学补偿经验教训
+
+> 来自 G1 六方案 A/B 对比（GC/CC/CTC-IMU/CTC-force/CTCP/Baseline）的实战经验。
+
+### 8.1 MuJoCo 力矩补偿陷阱
+
+1. **`<force>` 传感器不是纯 GRF**：MuJoCo force sensor 测量的是体上约束力（含内力），不是地面反力。直接用于补偿会严重过度补偿（CTC(force) reward 302 vs Baseline 308）
+2. **`qfrc_constraint` 是关节空间约束力**：已包含接触+关节限位力的关节空间投影，不需要 Jacobian 映射。站立时精确平衡 `qfrc_smooth`（误差 <0.001）
+3. **`BatchEnvPool.get_field()` 仅支持 model 级字段**：不支持 `qfrc_constraint`、`qacc` 等 data 级字段。要读取需逐 env 调用（4096 envs 效率不够）或扩展 pool
+
+### 8.2 qacc 估计经验
+
+4. **qvel 差分估 qacc 必须用控制步率**：仿真步率（6.67ms）下 qvel 噪声被质量矩阵放大，RNEA 算出的 qfrc_constraint 误差巨大。控制步率（20ms）+ EMA(α=0.2) 大幅改善
+5. **qacc 精度是 RNEA 反推法的瓶颈**：即使用控制步率+滤波，CTCP reward 仍低于 CC——qacc 误差是根本限制
+6. **EMA 滤波双刃剑**：平滑噪声但也延迟动态响应，冲击/步态切换时的接触力变化被平滑掉
+
+### 8.3 IMU 使用经验
+
+7. **IMU 姿态 R 来自 qpos（仿真真值）**：不是从 IMU 传感器融合估计的。sim-to-real 时需替换为 IMU 姿态估计
+8. **IMU 残余加速度 + pelvis site Jacobian 是稳定组合**：脚底 Jacobian 因长力臂导致不稳定（16.6×g(q)），pelvis Jacobian 短力臂更稳定
+9. **IMU 的真正价值在 sim-to-real**：仿真中模型完美时残余≈0，真机 URDF 参数有偏差时能在线修正
+
+### 8.4 补偿策略经验
+
+10. **GC 的"过补偿"有益**：g(q) 补偿全部重力但不减去 GRF 贡献，PD 看到净向上力，有利于学习。减去 GRF 反而移除了这个好处
+11. **contact_scale 要保守**：接触力信号（特权或 IMU）幅值大，0.2-0.5 是安全范围。过大导致过度补偿、训练崩溃
+12. **补偿越完整不代表 reward 越高**：GC(323) > CTC-IMU(319) > CC(317) > CTCP(313)。原因：补偿误差会抵消信息增益

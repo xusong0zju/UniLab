@@ -383,3 +383,38 @@ class PinocchioDynamicsModel:
             coriolis[i] = (self._data.tau - grav)[6:]
 
         return coriolis
+
+    def constraint_force(
+        self,
+        qpos_batch: np.ndarray,
+        qvel_batch: np.ndarray,
+        qacc_batch: np.ndarray,
+        actuator_force_batch: np.ndarray,
+    ) -> np.ndarray:
+        """Compute constraint force (contact + joint limits) in actuated joint space.
+
+        Uses the rigid-body dynamics equation::
+
+            qfrc_constraint = RNEA(q, q̇, q̈) - τ_actuator
+
+        where RNEA(q, q̇, q̈) = M(q)·q̈ + C(q,q̇)·q̇ + g(q).
+
+        This gives the total constraint force projected to actuated joints,
+        including ground reaction forces and joint limit forces.  It is the
+        *privileged* quantity that is only available in simulation (from the
+        dynamics equation) and must be estimated for sim-to-real deployment.
+
+        Args:
+            qpos_batch: MuJoCo qpos, shape ``(num_envs, nq_mj)``.
+            qvel_batch: MuJoCo qvel, shape ``(num_envs, nv_mj)``.
+            qacc_batch: Generalized accelerations, shape ``(num_envs, nv_mj)``.
+                Typically estimated from the qvel change between substeps.
+            actuator_force_batch: Actuator forces in actuated joint space,
+                shape ``(num_envs, nv_actuated)``.  For motor actuators with
+                unit gain this equals the ctrl signal from the previous step.
+
+        Returns:
+            Constraint forces for actuated joints, shape ``(num_envs, nv_actuated)``.
+        """
+        rnea_result = self.rnea(qpos_batch, qvel_batch, qacc_batch)
+        return rnea_result - np.asarray(actuator_force_batch, dtype=np.float64)
