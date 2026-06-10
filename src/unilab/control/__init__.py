@@ -2,6 +2,7 @@
 
 from unilab.control.base import MotorController
 from unilab.control.coriolis_comp_controller import CoriolisCompController
+from unilab.control.contact_comp_controller import ContactCompController
 from unilab.control.pd_controller import PDController
 from unilab.control.gravity_comp_controller import GravityCompController
 from unilab.control.ctc_controller import CTCController
@@ -14,6 +15,7 @@ __all__ = [
     "PDController",
     "GravityCompController",
     "CoriolisCompController",
+    "ContactCompController",
     "CTCController",
     "PinocchioDynamicsModel",
     "switch_to_motor_actuators",

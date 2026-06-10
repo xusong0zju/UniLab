@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from unilab.control.base import MotorController
+from unilab.control.contact_comp_controller import ContactCompController
 from unilab.control.coriolis_comp_controller import CoriolisCompController
 from unilab.control.gravity_comp_controller import GravityCompController
 from unilab.control.pd_controller import PDController
@@ -23,12 +24,15 @@ def resolve_controller(
     gravity_scale: float = 1.0,
     coriolis_comp_mask: Any = None,
     coriolis_scale: float = 1.0,
+    contact_comp_mask: Any = None,
+    contact_scale: float = 1.0,
 ) -> MotorController:
     """Create a MotorController by name.
 
     Args:
-        name: Controller type. One of ``"pd"``, ``"gravity_comp"``, ``"ctc"``.
-        dynamics_model: PinocchioDynamicsModel (required for gravity_comp and ctc).
+        name: Controller type. One of ``"pd"``, ``"gravity_comp"``,
+            ``"coriolis_comp"``, ``"contact_comp"``.
+        dynamics_model: PinocchioDynamicsModel (required for gravity_comp+).
         kp: Per-actuator position gains.
         kd: Per-actuator velocity gains.
         force_lower: Per-actuator torque lower bounds.
@@ -38,6 +42,9 @@ def resolve_controller(
         coriolis_comp_mask: Binary mask for selective Coriolis compensation.
             Defaults to gravity_comp_mask if not specified.
         coriolis_scale: Scaling factor for the Coriolis compensation term.
+        contact_comp_mask: Binary mask for selective contact compensation.
+            Defaults to gravity_comp_mask if not specified.
+        contact_scale: Scaling factor for the contact force compensation term.
 
     Returns:
         A MotorController instance.
@@ -86,11 +93,32 @@ def resolve_controller(
             coriolis_scale=coriolis_scale,
         )
 
+    if name == "contact_comp":
+        if dynamics_model is None:
+            raise ValueError("contact_comp controller requires a PinocchioDynamicsModel")
+        gmask = np.asarray(gravity_comp_mask, dtype=np.float64) if gravity_comp_mask is not None else None
+        cmask = np.asarray(coriolis_comp_mask, dtype=np.float64) if coriolis_comp_mask is not None else None
+        ctmask = np.asarray(contact_comp_mask, dtype=np.float64) if contact_comp_mask is not None else None
+        return ContactCompController(
+            dynamics_model=dynamics_model,
+            kp=np.asarray(kp, dtype=np.float64),
+            kd=np.asarray(kd, dtype=np.float64),
+            force_lower=np.asarray(force_lower, dtype=np.float64),
+            force_upper=np.asarray(force_upper, dtype=np.float64),
+            gravity_comp_mask=gmask,
+            gravity_scale=gravity_scale,
+            coriolis_comp_mask=cmask,
+            coriolis_scale=coriolis_scale,
+            contact_comp_mask=ctmask,
+            contact_scale=contact_scale,
+        )
+
     if name == "ctc":
         raise NotImplementedError(
-            "CTCController is not yet implemented. Use 'gravity_comp' instead."
+            "CTCController is not yet implemented. Use 'contact_comp' instead."
         )
 
     raise ValueError(
-        f"Unknown controller: {name!r}. Available: 'pd', 'gravity_comp', 'coriolis_comp', 'ctc'."
+        f"Unknown controller: {name!r}. "
+        f"Available: 'pd', 'gravity_comp', 'coriolis_comp', 'contact_comp', 'ctc'."
     )

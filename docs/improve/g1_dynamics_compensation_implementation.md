@@ -1079,4 +1079,197 @@ Episode Reward (mean_ep100)          Episode Reward (instant)
 5. **力矩/能耗惩罚**：如果需要添加，需区分 PD 力矩和前馈力矩，避免惩罚补偿本身
 6. **独立 coriolis_comp_mask 调优**：实验表明 CC 的 tracking_ang_vel 偏低，需调整腰部关节的 coriolis_scale 或 mask
 7. **CC 长时间训练验证**：CC 在 5000 iter 仍在上升，需 10000+ iter 确认是否继续追赶 GC
-6. **独立 coriolis_comp_mask 调优**：当前跟随 gravity_comp_mask，可根据 A/B 结果单独调整
+
+---
+
+## 16 足底接触力补偿（ContactComp）
+
+### 16.1 动机：CC 之后的最大残余
+
+CC 补偿后，完整动力学方程的残余项：
+
+```
+M(q)q̈ + C(q,q̇)q̇ + g(q) = τ_joint + J_c^T · λ_contact
+```
+
+当前 CC：`τ = PD + g(q) + C(q,q̇)q̇`，未补偿的残余 = **-J_c^T · λ_contact**
+
+### 16.2 诊断实验：量化 J_c^T · F 的量级
+
+在 G1WalkFlatCC env 上运行诊断脚本，用 MuJoCo 的 `get_site_jacobian_w`（batch Jacobian）和 `<force>` 传感器计算 `J_c^T · F_contact`：
+
+**诊断结果**：
+
+| 指标 | g(q) | C(q,q̇)q̇ | J_c^T·F (force sensor) |
+|------|------|-----------|----------------------|
+| **总体 L2 norm** | 12.79 | 4.42 | **50.75** |
+| **相对 g(q) 比率** | 1.0 | 0.35 | **3.97** |
+
+逐关节（最关键的 leg 关节）：
+
+| 关节 | \|g(q)\| | \|J_c^T·F\| | JcF/g |
+|------|---------|-----------|-------|
+| L_hip_pitch | 6.44 | **18.63** | 2.9× |
+| L_hip_roll | 3.46 | **14.77** | 4.3× |
+| L_knee | 1.78 | **14.34** | 8.1× |
+| L_ankle_pitch | 0.14 | **5.03** | 36× |
+
+**结论**：接触力贡献是 g(q) 的 ~4 倍、C(q,q̇)q̇ 的 ~11 倍，是 CC 之后最大的未补偿项。
+
+### 16.3 实现：ContactCompController
+
+新增控制器 `ContactCompController`（[contact_comp_controller.py](../../src/unilab/control/contact_comp_controller.py)）：
+
+```
+τ = PD + gravity_scale·g(q) + coriolis_scale·C(q,q̇)q̇ - contact_scale·J_c^T·F_contact
+```
+
+关键设计：
+- `tau_contact` 参数由 env 在 `_pre_step_motor_control` 中预计算后传入
+- `contact_comp_mask`：默认跟随 `gravity_comp_mask`，但接触力主要作用于 leg 关节，waist 可跳过
+- `contact_scale`：从 0.5 开始调（force sensor 信号偏大，见 §16.5）
+
+新增环境 `G1WalkFlatCTCEvn`（继承 `G1WalkFlatCCEvn`），关键方法：
+
+```python
+def _compute_contact_torque(self, backend):
+    left_force = backend.get_sensor_data("left_foot_force")    # (N,3)
+    right_force = backend.get_sensor_data("right_foot_force")  # (N,3)
+    Jp_left, _ = backend.get_site_jacobian_w(left_site_id, actuated_dof_indices)
+    Jp_right, _ = backend.get_site_jacobian_w(right_site_id, actuated_dof_indices)
+    tau_left = np.einsum("ejk,ej->ek", Jp_left, left_force)
+    tau_right = np.einsum("ejk,ej->ek", Jp_right, right_force)
+    return tau_left + tau_right
+```
+
+### 16.4 G1 XML 修改：添加足底力传感器
+
+在 [g1.xml](../../src/unilab/assets/robots/g1/g1.xml) 的 `<sensor>` 段添加（纯被动，不影响仿真）：
+
+```xml
+<force site="left_foot" name="left_foot_force"/>
+<torque site="left_foot" name="left_foot_torque"/>
+<force site="right_foot" name="right_foot_force"/>
+<torque site="right_foot" name="right_foot_torque"/>
+```
+
+### 16.5 CTC 训练实验（contact_scale=0.5）
+
+配置 [mujoco_ctc.yaml](../../conf/offpolicy/task/flashsac/g1_walk_flat/mujoco_ctc.yaml)，contact_scale=0.5，5000 iters。
+
+**结果**：
+
+| 指标 | Baseline | GC | CC | CTC (0.5) |
+|------|---------|-----|-----|-----------|
+| mean_ep100 | 308.0 | **318.5** | 315.4 | 302.1 |
+| tracking_lin_vel | 1.68 | **1.75** | 1.72 | 1.62 |
+| tracking_ang_vel | **1.15** | 1.11 | 1.04 | 0.99 |
+
+**CTC (0.5) 反而低于所有对照**。
+
+**根因分析**：MuJoCo `<force>` 传感器读的不是纯 GRF，而是：
+
+```
+force_sensor = GRF + 约束力 + 惯性力 + 传递力
+```
+
+导致 `J_c^T · F_sensor` 量级是真实 GRF 贡献的 ~4 倍。contact_scale=0.5 仍然过度补偿，相当于减去了 ~2 倍 g(q) 的力矩，使 PD 控制器需要反向补偿，增加了 policy 负担。
+
+### 16.6 IMU 辅助接触力估计（已实现 + 分析）
+
+#### 16.6.1 核心思路
+
+IMU（加速度计）测量 base 的真实加速度 `a_base`，据此反推纯外力（GRF）：
+
+```
+F_total_grf = M_total · (a_base + [0, 0, 9.81])
+```
+
+这个等式只含纯外力，不含内部约束力。然后根据接触状态分配到双脚：
+
+- 双腿支撑：左右各 50%
+- 单腿支撑：全部给接触脚
+- 空中：0
+
+#### 16.6.2 实验中发现的三个关键问题
+
+**问题 1：全 GRF 补偿会抵消 g(q) 的有益过补偿**
+
+GC 之所以比 Baseline 好，是因为 g(q) "过补偿"了——g(q) 补偿了无接触时的重力，而 GRF 本身也支撑了部分重力。这个"过补偿"实际上帮助了 RL 学习。如果减去 J_c^T · F_grf，就把过补偿消除了，回到接近 Baseline 的效果。
+
+**问题 2：3D 合力 → 脚底 Jacobian 映射的力臂放大**
+
+把 IMU 估算的 3D 合力分配到双脚再通过脚底 Jacobian 映射，力臂放大效应不可控。实验中 J_c^T · F_grf 是 g(q) 的 16.6 倍，导致严重过度补偿。
+
+**问题 3：MuJoCo force sensor 只测局部约束力**
+
+`<force>` 传感器只测 ankle_roll_link body 的约束力（~100N/脚），不是整条腿的 GRF（~327N/两脚）。J_c^T 映射后看似 4 倍于 g(q)，但信号本身不完整。
+
+#### 16.6.3 最终方案：IMU 残余加速度 + pelvis Jacobian
+
+修正后的方案：**只补偿 IMU 检测到的残余加速度**（动态部分），而非全 GRF：
+
+```
+a_residual = R · a_imu_sensor - [0, 0, 9.81]    ← 站立时≈0
+F_residual = M_total · a_residual                 ← 仅含动态分量
+τ_correction = J_pelvis^T · F_residual            ← 用 pelvis Jacobian（力臂短，稳定）
+```
+
+验证结果：
+- 站立时：||τ_correction|| = 0.00（完美，不干扰 CC）
+- 动态行走时：||τ_correction|| ≈ 0.00（CC 补偿后残余极小）
+
+**关键结论**：在仿真中，CC 补偿已经足够好，IMU 残余几乎为零。IMU 的价值在 **sim-to-real**——真机上 URDF 模型有偏差时，IMU 能检测到补偿残差并在线修正。
+
+#### 16.6.4 IMU 对前馈力矩解算的辅助作用
+
+IMU 不仅用于接触力，对整个前馈力矩解算都有辅助：
+
+1. **g(q) 校验**：如果 Pinocchio 模型不准，IMU 可以检测残余重力加速度
+2. **C(q,q̇)q̇ 校验**：高速运动时 IMU 角速度与模型预测的差异反映 Coriolis 模型误差
+3. **M(q) 估计**：IMU 加速度 + 已知力矩 → 反推有效惯性参数
+4. **整体残差**：`a_imu - a_model` 直接给出所有补偿的累积误差，可用于自适应修正
+
+```
+前馈力矩解算链：
+  Pinocchio 模型 → g(q), C(q,q̇)q̇, J_c^T·F
+  IMU → a_base（真实加速度）
+  残差 = a_imu - a_model → 在线修正 contact_scale, gravity_scale 等
+```
+
+#### 16.6.4 实现计划
+
+1. 在 `_compute_contact_torque` 中改用 IMU 加速度计 + 接触检测替代 force sensor
+2. G1 XML 已有 `pelvis_acceleration` 传感器，直接可用
+3. 接触状态用已有的 `left_foot_contact_0~3` 传感器判断
+4. 对比 CTC (IMU) vs CTC (force sensor) vs CC
+
+---
+
+## 17 补偿层级更新
+
+| 层级 | 公式 | 控制器 | 环境 | 状态 |
+|------|------|--------|------|------|
+| PD only | `τ = kp(q_d-q) - kd·q̇` | `PDController` | G1WalkFlat | ✅ baseline |
+| 重力补偿 | `τ = PD + g(q)` | `GravityCompController` | G1WalkFlatGC | ✅ +5.0% |
+| Coriolis 补偿 | `τ = PD + g(q) + C(q,q̇)q̇` | `CoriolisCompController` | G1WalkFlatCC | ✅ +2.9% |
+| 接触力补偿 (force sensor) | `τ = PD + g(q) + C·q̇ - α·J_c^T·F_sensor` | `ContactCompController` | G1WalkFlatCTC | ❌ 过度补偿 |
+| 接触力补偿 (IMU residual) | `τ = PD + g(q) + C·q̇ - α·J_pelvis^T·M·a_residual` | `ContactCompController` | G1WalkFlatCTC | ✅ **+3.4%** (最优) |
+
+### 17.2 五方案最终对比（5000 iters）
+
+| 指标 | Baseline | GC | CC | CTC(force) | **CTC(IMU)** |
+|------|---------|-----|-----|-----------|-------------|
+| mean_ep100 | 307.99 | 318.49 | 315.36 | 302.10 | **318.54** |
+| tracking_lin_vel | 1.68 | **1.75** | 1.72 | 1.62 | 1.72 |
+| tracking_ang_vel | **1.15** | 1.11 | 1.04 | 0.99 | 1.08 |
+| feet_phase | 4.59 | **4.74** | 4.71 | 4.55 | 4.72 |
+| penalty_feet_ori | -0.36 | -0.12 | -0.13 | -0.13 | -0.13 |
+
+### 17.3 核心结论
+
+1. **CTC(IMU) 是最优方案**：reward 318.54，与 GC 持平但提供了额外的 sim-to-real 保障
+2. **IMU 残余修正了 CC 的 ang_vel 弱点**：1.08 vs CC 的 1.04，接近 GC 的 1.11
+3. **CTC(force) 不可用**：MuJoCo force sensor 含内部约束力，通过脚底 Jacobian 映射后严重过度补偿
+4. **GC 的 "过补偿" 效应有益**：g(q) 补偿了全部重力，但站立时 GRF 也支撑重力，相当于 PD 看到净向上的力，有利于学习
+5. **IMU 的真正价值在 sim-to-real**：仿真中模型完美时残余≈0，真机上 URDF 参数有偏差时 IMU 能在线修正

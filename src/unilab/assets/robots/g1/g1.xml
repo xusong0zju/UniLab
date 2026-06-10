@@ -374,10 +374,14 @@
     <framepos objtype="site" objname="left_foot" name="left_foot_pos"/>
     <framequat objtype="site" objname="left_foot" name="left_foot_quat"/>
     <framezaxis objtype="site" objname="left_foot" name="left_foot_upvector"/>
+    <force site="left_foot" name="left_foot_force"/>
+    <torque site="left_foot" name="left_foot_torque"/>
 
     <framepos objtype="site" objname="right_foot" name="right_foot_pos"/>
     <framequat objtype="site" objname="right_foot" name="right_foot_quat"/>
     <framezaxis objtype="site" objname="right_foot" name="right_foot_upvector"/>
+    <force site="right_foot" name="right_foot_force"/>
+    <torque site="right_foot" name="right_foot_torque"/>
   </sensor>
 
 </mujoco>

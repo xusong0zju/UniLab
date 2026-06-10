@@ -1896,3 +1896,284 @@ class G1WalkFlatCCEvn(G1BaseEnv):
             np.sum(self._upper_body_pose_weights * np.square(diff), axis=1),
             dtype=get_global_dtype(),
         )
+
+
+
+# ======================================================================== #
+# G1 Walk with Contact-Aware Compensation (motor actuator + Pinocchio + GRF) #
+# ======================================================================== #
+
+
+@dataclass
+class G1WalkCTCControlConfig:
+    """Control config for G1 with motor actuators, gravity + Coriolis + contact compensation."""
+
+    action_scale: float = 1.0
+    simulate_action_latency: bool = False
+    gravity_comp_mask: list[float] | None = None
+    gravity_scale: float = 1.0
+    coriolis_comp_mask: list[float] | None = None
+    coriolis_scale: float = 1.0
+    contact_comp_mask: list[float] | None = None
+    contact_scale: float = 1.0
+
+
+@registry.envcfg("G1WalkFlatCTC")
+@dataclass
+class G1WalkFlatCTCCfg(G1WalkEnvCfg):
+    """Config for G1 walk with gravity + Coriolis + contact force compensation."""
+
+    scene: SceneCfg = field(
+        default_factory=lambda: SceneCfg(
+            model_file=str(ASSETS_ROOT_PATH / "robots" / "g1" / "scene_flat.xml")
+        )
+    )
+    control_config: G1WalkCTCControlConfig = field(  # type: ignore[assignment]
+        default_factory=G1WalkCTCControlConfig
+    )
+    curriculum: CurriculumConfig = field(default_factory=_walk_curriculum)
+
+
+@registry.env("G1WalkFlatCTC", sim_backend="mujoco")
+class G1WalkFlatCTCEvn(G1WalkFlatCCEvn):
+    """G1 walk with motor actuators and full dynamics compensation (PD + GC + CC - Contact).
+
+    Extends G1WalkFlatCCEvn by additionally compensating for foot contact forces:
+    τ = kp(q_d-q) - kd·q̇ + g(q) + C(q,q̇)q̇ - contact_scale · J_c^T · F_contact
+
+    The contact force term J_c^T · F_contact is the joint-space contribution
+    of ground reaction forces at the feet.  Diagnostic shows this is ~4× the
+    magnitude of gravity for G1 walking, making it the largest uncompensated
+    residual after CC compensation.
+
+    The policy's obs/action space is identical to G1WalkFlat for fair A/B
+    comparison.
+    """
+
+    _cfg: G1WalkFlatCTCCfg
+
+    def __init__(self, cfg: G1WalkFlatCTCCfg, num_envs=1, backend_type="mujoco"):
+        if cfg.reward_config is None:
+            raise ValueError("reward_config must be provided via Hydra configuration")
+
+        # Create backend
+        backend = create_backend(
+            backend_type,
+            cfg.scene,
+            num_envs,
+            cfg.sim_dt,
+            base_name=cfg.asset.base_name,
+            push_body_name=cfg.domain_rand.push_body_name,
+            motrix_max_iterations=cfg.motrix_max_iterations,
+            post_step_forward_sensor=cfg.post_step_forward_sensor,
+        )
+
+        # Switch MuJoCo position actuators → motor actuators before materialization.
+        from unilab.control.actuator_switch import switch_to_motor_actuators
+        from unilab.control.pinocchio_model import PinocchioDynamicsModel
+
+        actuator_info = switch_to_motor_actuators(backend._model)
+
+        # Build Pinocchio dynamics model from MuJoCo model (cold path)
+        dynamics_model = PinocchioDynamicsModel(backend._model)
+
+        # Initialize base env (skip CCEvn, go to G1BaseEnv — same pattern as CCEvn)
+        super(G1WalkFlatCCEvn, self).__init__(cfg, backend, num_envs)
+
+        # --- G1WalkEnv setup (replicated, since G1BaseEnv.__init__ doesn't do this) ---
+        self._enable_reward_log = True
+        self._reward_cfg = cfg.reward_config
+
+        self._gait_phase_delta = float(
+            2.0 * math.pi * self._reward_cfg.gait_frequency * cfg.ctrl_dt
+        )
+        self._pose_weights = np.array(self._reward_cfg.pose_weights, dtype=get_global_dtype())
+        if self._pose_weights.shape[0] != self._num_action:
+            raise ValueError("pose_weights length mismatch")
+        self._upper_body_pose_weights = build_upper_body_pose_weights(self._reward_cfg.pose_weights)
+
+        # Episode length tracking / curriculum
+        self._episode_tracker: EpisodeLengthTracker | None = None
+        self._penalty_curriculum: PenaltyCurriculum | None = None
+        if cfg.curriculum.enabled:
+            self._episode_tracker = EpisodeLengthTracker(num_envs)
+            self._penalty_curriculum = PenaltyCurriculum(
+                self,
+                enabled=True,
+                initial_scale=cfg.curriculum.initial_scale,
+                min_scale=cfg.curriculum.min_scale,
+                max_scale=cfg.curriculum.max_scale,
+                level_down_threshold=cfg.curriculum.level_down_threshold,
+                level_up_threshold=cfg.curriculum.level_up_threshold,
+                degree=cfg.curriculum.degree,
+            )
+
+        self._init_reward_functions()
+
+        # --- Motor actuator specific setup ---
+        num_actions = self._num_action
+        self._base_motor_kp = actuator_info.kp.copy()
+        self._base_motor_kd = actuator_info.kd.copy()
+        self._motor_kp = np.broadcast_to(self._base_motor_kp, (num_envs, num_actions)).copy()
+        self._motor_kd = np.broadcast_to(self._base_motor_kd, (num_envs, num_actions)).copy()
+        self._force_lower = actuator_info.force_lower.copy()
+        self._force_upper = actuator_info.force_upper.copy()
+
+        # Compensation masks
+        ctc_config = cfg.control_config
+        gravity_comp_mask = None
+        if ctc_config.gravity_comp_mask is not None:
+            gravity_comp_mask = np.asarray(ctc_config.gravity_comp_mask, dtype=np.float64)
+            if gravity_comp_mask.shape[0] != num_actions:
+                raise ValueError(
+                    f"gravity_comp_mask length ({gravity_comp_mask.shape[0]}) "
+                    f"must match num_actions ({num_actions})"
+                )
+
+        coriolis_comp_mask = None
+        if ctc_config.coriolis_comp_mask is not None:
+            coriolis_comp_mask = np.asarray(ctc_config.coriolis_comp_mask, dtype=np.float64)
+            if coriolis_comp_mask.shape[0] != num_actions:
+                raise ValueError(
+                    f"coriolis_comp_mask length ({coriolis_comp_mask.shape[0]}) "
+                    f"must match num_actions ({num_actions})"
+                )
+
+        contact_comp_mask = None
+        if ctc_config.contact_comp_mask is not None:
+            contact_comp_mask = np.asarray(ctc_config.contact_comp_mask, dtype=np.float64)
+            if contact_comp_mask.shape[0] != num_actions:
+                raise ValueError(
+                    f"contact_comp_mask length ({contact_comp_mask.shape[0]}) "
+                    f"must match num_actions ({num_actions})"
+                )
+
+        # Build the ContactCompController (extends CoriolisComp with contact)
+        from unilab.control.contact_comp_controller import ContactCompController
+
+        self._controller = ContactCompController(
+            dynamics_model=dynamics_model,
+            kp=self._base_motor_kp,
+            kd=self._base_motor_kd,
+            force_lower=self._force_lower,
+            force_upper=self._force_upper,
+            gravity_comp_mask=gravity_comp_mask,
+            gravity_scale=ctc_config.gravity_scale,
+            coriolis_comp_mask=coriolis_comp_mask,
+            coriolis_scale=ctc_config.coriolis_scale,
+            contact_comp_mask=contact_comp_mask,
+            contact_scale=ctc_config.contact_scale,
+        )
+        self._dynamics_model = dynamics_model
+        self._last_motor_ctrl = np.zeros((num_envs, num_actions), dtype=get_global_dtype())
+
+        # Pre-compute site IDs and DoF indices for contact Jacobian
+        import mujoco as _mj
+        mj_model = backend._model
+        self._left_foot_site_id = _mj.mj_name2id(
+            mj_model, _mj.mjtObj.mjOBJ_SITE, "left_foot"
+        )
+        self._right_foot_site_id = _mj.mj_name2id(
+            mj_model, _mj.mjtObj.mjOBJ_SITE, "right_foot"
+        )
+        self._pelvis_imu_site_id = _mj.mj_name2id(
+            mj_model, _mj.mjtObj.mjOBJ_SITE, "imu_in_pelvis"
+        )
+        # Actuated DoF indices (skip floating base, first 6 DoFs)
+        self._actuated_dof_indices = np.arange(6, mj_model.nv, dtype=np.int32)
+
+        # Total robot mass for IMU-based GRF estimation
+        self._robot_mass = float(np.sum(mj_model.body_mass))
+
+        # Register pre_step_control callback
+        self._backend.set_pre_step_control(self._pre_step_motor_control)
+
+        # DR: kp/kd handled by env, not backend (reuse G1WalkGCDomainRandomizationProvider)
+        dr_provider = G1WalkGCDomainRandomizationProvider(
+            base_kp=self._base_motor_kp, base_kd=self._base_motor_kd
+        )
+        self._init_domain_randomization(dr_provider)
+
+    def _compute_contact_torque(self, backend: Any) -> np.ndarray:
+        """Compute IMU-residual-based contact torque correction.
+
+        Strategy:
+          After g(q) + C(q,q̇)q̇ compensation, any residual base acceleration
+          indicates unmodeled dynamics (contact, impacts, model errors).
+          We use IMU to detect this residual and apply a proportional
+          correction in joint space via the base site Jacobian.
+
+          a_residual = R · a_imu_sensor - [0, 0, 9.81]  (world frame)
+          F_residual = M_total · a_residual
+          τ_correction = J_pelvis^T · F_residual  (joint space)
+
+          For standing: a_residual ≈ 0 → no correction (same as CC) ✓
+          For impacts/walking: captures dynamic GRF beyond gravity ✓
+        """
+        num_envs = self._num_envs
+
+        # ── 1. Compute residual acceleration from IMU ─────────────
+        accel_local = backend.get_sensor_data("pelvis_acceleration")  # (N, 3)
+
+        # Get base orientation
+        full_qpos = backend.get_full_qpos()
+        qw, qx, qy, qz = full_qpos[:, 3], full_qpos[:, 4], full_qpos[:, 5], full_qpos[:, 6]
+
+        R = np.zeros((num_envs, 3, 3), dtype=np.float64)
+        R[:, 0, 0] = 1 - 2*(qy*qy + qz*qz)
+        R[:, 0, 1] = 2*(qx*qy - qw*qz)
+        R[:, 0, 2] = 2*(qx*qz + qw*qy)
+        R[:, 1, 0] = 2*(qx*qy + qw*qz)
+        R[:, 1, 1] = 1 - 2*(qx*qx + qz*qz)
+        R[:, 1, 2] = 2*(qy*qz - qw*qx)
+        R[:, 2, 0] = 2*(qx*qz - qw*qy)
+        R[:, 2, 1] = 2*(qy*qz + qw*qx)
+        R[:, 2, 2] = 1 - 2*(qx*qx + qy*qy)
+
+        # a_residual = R · a_sensor - g_up  (coordinate acceleration, ~0 when standing)
+        accel_world = np.einsum("eij,ej->ei", R, accel_local)
+        accel_world[:, 2] -= 9.81
+
+        # Residual force on the base
+        f_residual = self._robot_mass * accel_world  # (N, 3)
+
+        # ── 2. Map to joint space via pelvis site Jacobian ────────
+        # Use the IMU-in-pelvis site Jacobian (more stable than foot Jacobian)
+        Jp_pelvis, _ = backend.get_site_jacobian_w(
+            self._pelvis_imu_site_id, self._actuated_dof_indices
+        )
+
+        tau_contact = np.einsum("ejk,ej->ek", Jp_pelvis, f_residual)
+
+        return tau_contact
+
+    def _pre_step_motor_control(self, backend: Any, policy_ctrl: np.ndarray) -> np.ndarray:
+        """Pre-step callback: convert target positions → motor torques with full compensation.
+
+        τ = kp(q_d-q) - kd·q̇ + g(q) + C(q,q̇)q̇ - contact_scale · J_c^T · F_contact
+        """
+        self._dynamics_model.invalidate_cache()
+
+        joint_pos = backend.get_dof_pos()
+        joint_vel = backend.get_dof_vel()
+        full_qpos = backend.get_full_qpos()
+        full_qvel = backend.get_full_qvel()
+
+        # Compute contact torque contribution (J_c^T · F)
+        tau_contact = self._compute_contact_torque(backend)
+
+        # Update controller gains (may have been randomized by DR at reset)
+        self._controller.kp = self._motor_kp
+        self._controller.kd = self._motor_kd
+
+        # Compute motor torques with all compensation terms
+        motor_ctrl = self._controller.compute(
+            policy_ctrl,
+            joint_pos,
+            joint_vel,
+            full_qpos=full_qpos,
+            full_qvel=full_qvel,
+            tau_contact=tau_contact,
+        )
+        self._last_motor_ctrl = motor_ctrl
+        return motor_ctrl
