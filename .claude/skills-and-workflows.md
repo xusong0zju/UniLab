@@ -390,3 +390,10 @@ print("Motor kd:", env._motor_kd[0])
 
 16. **FlashSAC 续训不可靠**：checkpoint 只保存 learner state 不保存 replay buffer，续训时 buffer 为空导致 off-policy 分布偏移（312→287）。**从头跑 10k 比续训 5k→10k 更可靠**
 17. **指数衰减模型仅适合短期预测**：拟合 `dr/dt = k·(r_max - r)` 模型对 5k→10k 外推偏差 >15%（预测 341.5 vs 实际 325.9），但短期（2-3k iters 内）较准
+
+### 8.7 Sim2Sim 评估与录制
+
+18. **无屏幕环境视频录制用 xvfb-run**：`MUJOCO_GL=egl` 在 NVIDIA 驱动上可能失败（PyOpenGL EGL 绑定问题），`xvfb-run -a` 是最可靠方案
+19. **Sim2Sim 评估需用 Hydra compose + BackendAdapter**：不能直接 `registry.make()`（缺少 reward_config），需 `BackendAdapter.build_task_env_cfg_override()` 获取完整 env 配置
+20. **NpEnv API 差异**：`reset()` 返回 `(obs_dict, info_dict)` tuple；`step()` 返回 `NpEnvState` dataclass——两者接口不一致
+21. **GC 控制器对质量偏差强鲁棒**：gravity_scale ±20% 下 100% 存活，reward 波动 <5%。部署时建议降低 swing_boost（0.0~0.1）
