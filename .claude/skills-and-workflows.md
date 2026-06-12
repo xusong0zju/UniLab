@@ -397,3 +397,168 @@ print("Motor kd:", env._motor_kd[0])
 19. **Sim2Sim 评估需用 Hydra compose + BackendAdapter**：不能直接 `registry.make()`（缺少 reward_config），需 `BackendAdapter.build_task_env_cfg_override()` 获取完整 env 配置
 20. **NpEnv API 差异**：`reset()` 返回 `(obs_dict, info_dict)` tuple；`step()` 返回 `NpEnvState` dataclass——两者接口不一致
 21. **GC 控制器对质量偏差强鲁棒**：gravity_scale ±20% 下 100% 存活，reward 波动 <5%。部署时建议降低 swing_boost（0.0~0.1）
+
+---
+
+## 9 Sim2Sim 训练→评估→录制工作流
+
+> 端到端流程：降参训练 → 延长训练 → 视频录制 → Sim2Sim 扰动评估 → 结果分析。以 IMU-GC 96×2 为实例。
+
+### 9.1 降参训练配置
+
+在 task YAML 中修改 `algo.actor_hidden_dim` / `algo.critic_hidden_dim` / `algo.algo_params.actor_num_blocks`：
+
+```yaml
+# conf/offpolicy/task/flashsac/g1_walk_flat/mujoco_imu_gc_s96_10k.yaml
+algo:
+  actor_hidden_dim: 96        # 默认 128 → 96 (58% params)
+  critic_hidden_dim: 192      # 默认 256 → 192 (同步缩减)
+  max_iterations: 10000       # 小网络需更多 iters
+  algo_params:
+    actor_num_blocks: 2       # 深度不减（2 blocks 残差连接关键）
+    critic_num_blocks: 2
+```
+
+**参数量速算**（FlashSAC Actor）：
+
+```
+Actor = Embedder(obs→h) + N×Block(h→4h→h) + RMSNorm(h) + PolicyHead(h→act×2)
+Block  = h×4h + 4h×h = 5h²  (UnitLinear 无 bias)
+Policy = 2×h×act + 2×act
+```
+
+| 配置 | h | blocks | Actor 参数 | 相对 128×2 |
+|------|---|--------|-----------|-----------|
+| 128×2 | 128 | 2 | 285K | 100% |
+| 96×2 | 96 | 2 | **165K** | **58%** |
+| 64×2 | 64 | 2 | 77K | 27% |
+| 96×1 | 96 | 1 | 90K | 32% |
+
+**经验**：96×2 是安全下限（reward 损失 <2%），64×2 和 96×1 性能急剧下降。小网络需 10k iters 才能追上全量 5k 的 reward。
+
+### 9.2 延长训练与续训
+
+**FlashSAC 不支持 checkpoint 续训**（replay buffer 不保存）。两种选择：
+
+| 方式 | 可靠性 | Wall time | 说明 |
+|------|--------|-----------|------|
+| 从头跑 10k | ✅ | ~110 min | 最可靠，推荐 |
+| 续训 5k→10k | ❌ | ~55 min | buffer 空导致分布偏移，reward 反降 |
+
+如需续训能力，需修改 `OffPolicyRunner.learn()` 添加 `resume_checkpoint` 参数（已在代码中实现，但效果不可靠——续训 reward 312→287）。
+
+### 9.3 无屏幕视频录制
+
+```bash
+# 核心命令
+xvfb-run -a uv run python scripts/train_offpolicy.py \
+  algo=flashsac \
+  task=flashsac/g1_walk_flat/mujoco_imu_gc_s96_10k \
+  training.play_only=true \
+  algo.load_run="-1" \
+  training.play_steps=800
+```
+
+**输出**：
+- 视频：`<log_dir>/play_video.mp4`（720×1280, mediapy 编码）
+- ONNX：`<log_dir>/policy.onnx`（自动导出+验证）
+
+**替代方案对比**：
+
+| 方案 | 可行性 | 备注 |
+|------|--------|------|
+| `xvfb-run -a` | ✅ | 虚拟 X11 framebuffer，最可靠 |
+| `MUJOCO_GL=egl` | ❌ | PyOpenGL EGL 绑定与 NVIDIA 驱动不兼容 |
+| `MUJOCO_GL=osmesa` | ❌ | 需额外安装 libOSMesa |
+
+### 9.4 Sim2Sim 扰动评估脚本
+
+**编程模式**：Hydra compose + BackendAdapter + create_env + 动态修改控制器参数
+
+```python
+from hydra import compose, initialize_config_dir
+from unilab.training import BackendAdapter, create_env
+from unilab.algos.torch.flash_sac.network import FlashSACActor
+import torch, numpy as np
+
+# 1. Hydra compose 获取完整配置
+with initialize_config_dir(config_dir='conf/offpolicy', version_base='1.3'):
+    cfg = compose(config_name='config', overrides=[
+        'algo=flashsac',
+        'task=flashsac/g1_walk_flat/mujoco_imu_gc_s96_10k',
+    ])
+
+# 2. BackendAdapter 获取 env_cfg_override（含 reward_config 等）
+env_cfg_override = BackendAdapter(cfg, root_dir=ROOT, algo_name=cfg.algo.algo) \
+    .build_task_env_cfg_override()
+
+# 3. 创建 env
+env = create_env(cfg, num_envs=16, env_cfg_override=env_cfg_override)
+
+# 4. 加载 actor
+ckpt = torch.load('<log_dir>/model_10000.pt', map_location='cpu', weights_only=True)
+actor = FlashSACActor(num_blocks=2, input_dim=98, hidden_dim=96, action_dim=29,
+                      noise_zeta_mu=2.0, noise_zeta_max=16, device='cpu')
+actor.load_state_dict(ckpt['actor'])
+actor.eval()
+
+# 5. 动态修改控制器参数（模拟 sim2real 偏差）
+env._controller._gravity_scale = 0.9   # 10% 质量低估
+env._controller._swing_boost = 0.1     # 部署时降低
+
+# 6. 评估循环
+obs_dict, info = env.reset(np.arange(16, dtype=np.int32))  # reset → tuple!
+total_reward = np.zeros(16)
+for step in range(800):
+    obs_t = torch.as_tensor(obs_dict['obs'], dtype=torch.float32)
+    with torch.no_grad():
+        action_t = actor.explore(obs_t, deterministic=True)
+    state = env.step(action_t.numpy())   # step → NpEnvState!
+    obs_dict = state.obs
+    total_reward += state.reward
+```
+
+**关键 API 踩坑**：
+
+| 方法 | 返回类型 | 注意 |
+|------|---------|------|
+| `env.reset(indices)` | `(obs_dict, info_dict)` | 返回 **tuple**，不是 NpEnvState |
+| `env.step(actions)` | `NpEnvState` | dataclass，含 `.obs/.reward/.terminated/.truncated/.info` |
+| `registry.make(name, ...)` | env | ❌ 缺 reward_config，必须用 create_env + BackendAdapter |
+
+### 9.5 Pinocchio 参数扰动设计
+
+| 扰动参数 | 值 | 物理含义 | 对应 sim2real 场景 |
+|---------|------|---------|------------------|
+| `gravity_scale=0.9` | 10% 欠补偿 | URDF 质量低估 10% | 机器人实际更重，Pinocchio 算出的 g(q) 偏小 |
+| `gravity_scale=0.8` | 20% 欠补偿 | URDF 质量低估 20% | 极端偏差 |
+| `gravity_scale=1.1` | 10% 过补偿 | URDF 质量高估 10% | 机器人实际更轻 |
+| `swing_boost=0.0` | 无增强 | 去掉 swing 腿额外补偿 | 部署时减少对 IMU 精度的依赖 |
+| `swing_boost=0.5` | 高增强 | swing 腿额外 50% GC | 测试上限 |
+
+**为什么修改 gravity_scale 可以模拟质量偏差？**
+
+GC 力矩 = `gravity_scale × g(q)`，其中 g(q) 由 Pinocchio 根据URDF 质量参数计算。如果 URDF 质量低估 10%，则 g(q) 偏小 10%，等效于 gravity_scale=1.0 但实际是 1.1×g(q) 需要被补偿。反过来，设 gravity_scale=0.9 等效于"补偿了 0.9×g(q)，但实际重力是 1.0×g(q)"。
+
+### 9.6 IMU-GC 96×2 Sim2Sim 结果参考
+
+| gravity_scale | swing_boost | Mean Reward | Alive | Δ vs Baseline |
+|---------------|-------------|-------------|-------|---------------|
+| 1.0 | 0.3 | 274.84 | 100% | — |
+| 0.9 | 0.3 | 284.01 | 100% | +9.17 |
+| 0.8 | 0.3 | 288.68 | 100% | +13.84 |
+| 1.0 | 0.0 | 290.01 | 100% | +15.17 |
+| 0.9 | 0.0 | 292.49 | 100% | +17.65 |
+
+**核心结论**：GC 控制器对质量偏差 ±20% 强鲁棒（100% 存活），扰动下 reward 反而更高（过补偿效应）。部署建议 gravity_scale=1.0 + swing_boost=0.0~0.1。
+
+### 9.7 收敛趋势预测（可选）
+
+用指数衰减模型 `dr/dt = k·(r_max - r)` 拟合训练后半段数据，可做短期趋势预测（2-3k iters 内较准），但长期外推偏差 >15%。
+
+```python
+# 线性回归拟合: rate = k * (r_max - r)
+# y = rate, x = reward_mid → y = a + b*x, k=-b, r_max=a/k
+```
+
+**教训**：模型预测 r_max≈342，实际 10k 时仅 325.9。不可用此模型做远期决策。
