@@ -185,8 +185,23 @@ class OffPolicyRunner(AsyncRunner):
         save_interval: int = 50,
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
+        resume_checkpoint: str | None = None,
+        resume_iteration: int = 0,
     ) -> None:
-        """Unified training loop for off-policy algorithms."""
+        """Unified training loop for off-policy algorithms.
+
+        Args:
+            resume_checkpoint: Path to a checkpoint .pt file to load learner
+                state from (actor, critic, optimizers, schedulers, normalizers).
+                The replay buffer starts fresh.
+            resume_iteration: The iteration number that ``resume_checkpoint``
+                was saved at.  Used to offset iteration counters in logs.
+        """
+        if resume_checkpoint is not None:
+            import torch as _torch
+            ckpt = _torch.load(resume_checkpoint, map_location=self.device, weights_only=True)
+            self.learner.load_state_dict(ckpt)
+            print(f"[Runner] Resumed from checkpoint: {resume_checkpoint} (iter {resume_iteration})")
         os.makedirs(log_dir, exist_ok=True)
         trace_output_path = None
         trace_recorder: TraceRecorder | None = None

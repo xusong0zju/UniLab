@@ -643,6 +643,8 @@ def main(cfg: DictConfig) -> None:
                     save_interval=cfg.algo.save_interval,
                     log_dir=log_dir,
                     logger_type=cfg.training.logger,
+                    resume_checkpoint=getattr(cfg.training, "resume_checkpoint", None),
+                    resume_iteration=getattr(cfg.training, "resume_iteration", 0),
                 )
                 if tracker is not None:
                     tracker.update_summary(getattr(runner, "last_run_summary", None))

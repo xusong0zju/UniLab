@@ -369,6 +369,8 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
         save_interval: int = 50,
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
+        resume_checkpoint: str | None = None,
+        resume_iteration: int = 0,
     ) -> None:
         if self.num_gpus <= 1:
             super().learn(
@@ -376,6 +378,8 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
                 save_interval=save_interval,
                 log_dir=log_dir,
                 logger_type=logger_type,
+                resume_checkpoint=resume_checkpoint,
+                resume_iteration=resume_iteration,
             )
             return
         self._learn_multi_gpu(
