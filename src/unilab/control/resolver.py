@@ -8,6 +8,7 @@ from unilab.control.base import MotorController
 from unilab.control.contact_comp_controller import ContactCompController
 from unilab.control.coriolis_comp_controller import CoriolisCompController
 from unilab.control.gravity_comp_controller import GravityCompController
+from unilab.control.imu_gc_controller import IMUGravityCompController
 from unilab.control.pd_controller import PDController
 from unilab.control.pinocchio_model import PinocchioDynamicsModel
 
@@ -26,12 +27,14 @@ def resolve_controller(
     coriolis_scale: float = 1.0,
     contact_comp_mask: Any = None,
     contact_scale: float = 1.0,
+    swing_boost: float = 0.0,
+    disturbance_scale: float = 0.0,
 ) -> MotorController:
     """Create a MotorController by name.
 
     Args:
         name: Controller type. One of ``"pd"``, ``"gravity_comp"``,
-            ``"coriolis_comp"``, ``"contact_comp"``.
+            ``"imu_gc"``, ``"coriolis_comp"``, ``"contact_comp"``.
         dynamics_model: PinocchioDynamicsModel (required for gravity_comp+).
         kp: Per-actuator position gains.
         kd: Per-actuator velocity gains.
@@ -113,6 +116,22 @@ def resolve_controller(
             contact_scale=contact_scale,
         )
 
+    if name == "imu_gc":
+        if dynamics_model is None:
+            raise ValueError("imu_gc controller requires a PinocchioDynamicsModel")
+        mask = np.asarray(gravity_comp_mask, dtype=np.float64) if gravity_comp_mask is not None else None
+        return IMUGravityCompController(
+            dynamics_model=dynamics_model,
+            kp=np.asarray(kp, dtype=np.float64),
+            kd=np.asarray(kd, dtype=np.float64),
+            force_lower=np.asarray(force_lower, dtype=np.float64),
+            force_upper=np.asarray(force_upper, dtype=np.float64),
+            gravity_comp_mask=mask,
+            gravity_scale=gravity_scale,
+            swing_boost=swing_boost,
+            disturbance_scale=disturbance_scale,
+        )
+
     if name == "ctc":
         raise NotImplementedError(
             "CTCController is not yet implemented. Use 'contact_comp' instead."
@@ -120,5 +139,5 @@ def resolve_controller(
 
     raise ValueError(
         f"Unknown controller: {name!r}. "
-        f"Available: 'pd', 'gravity_comp', 'coriolis_comp', 'contact_comp', 'ctc'."
+        f"Available: 'pd', 'gravity_comp', 'imu_gc', 'coriolis_comp', 'contact_comp', 'ctc'."
     )

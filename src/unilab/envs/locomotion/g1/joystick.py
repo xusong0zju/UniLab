@@ -2459,3 +2459,644 @@ class G1WalkFlatCTCPvn(G1WalkFlatCCEvn):
         self._motor_ctrl_prev = motor_ctrl.copy()
 
         return motor_ctrl
+
+
+# ═══════════════════════════════════════════════════════════════════════ #
+# IMU-Enhanced GC — Gravity comp with swing-boost + disturbance correction #
+# ═══════════════════════════════════════════════════════════════════════ #
+
+
+@dataclass
+class G1WalkIMUGCControlConfig:
+    """Control config for G1 with IMU-enhanced gravity compensation.
+
+    Compared to G1WalkGCControlConfig, adds:
+    - swing_boost: extra gravity compensation for swing-leg joints
+    - disturbance_scale: IMU residual disturbance correction strength
+    - disturbance_threshold: activation threshold for disturbance correction (N)
+    """
+
+    action_scale: float = 1.0
+    simulate_action_latency: bool = False
+    gravity_comp_mask: list[float] | None = None
+    gravity_scale: float = 1.0
+    swing_boost: float = 0.0
+    disturbance_scale: float = 0.0
+    disturbance_threshold: float = 5.0
+
+
+@registry.envcfg("G1WalkFlatIMUGC")
+@dataclass
+class G1WalkFlatIMUGCCfg(G1WalkEnvCfg):
+    """Config for G1 walk with IMU-enhanced gravity compensation."""
+
+    scene: SceneCfg = field(
+        default_factory=lambda: SceneCfg(
+            model_file=str(ASSETS_ROOT_PATH / "robots" / "g1" / "scene_flat.xml")
+        )
+    )
+    control_config: G1WalkIMUGCControlConfig = field(  # type: ignore[assignment]
+        default_factory=G1WalkIMUGCControlConfig
+    )
+    curriculum: CurriculumConfig = field(default_factory=_walk_curriculum)
+
+
+@registry.env("G1WalkFlatIMUGC", sim_backend="mujoco")
+class G1WalkFlatIMUGCEvn(G1BaseEnv):
+    """G1 walk with IMU-enhanced gravity compensation.
+
+    Compared to G1WalkFlatGCEvn:
+    1. Swing-leg gravity boost: swing legs receive extra GC (no GRF support)
+    2. Disturbance correction: IMU residual acceleration → correction torque,
+       gated by threshold to avoid weakening stance over-compensation
+
+    Formula:
+        τ = PD + gravity_scale·g(q)·(mask + swing_boost·swing_mask)
+            + disturbance_scale·τ_disturbance
+
+    Swing-leg detection uses gait_phase (from env) cross-validated with
+    IMU residual acceleration (stance → large downward residual from GRF).
+    """
+
+    _cfg: G1WalkFlatIMUGCCfg
+
+    def __init__(self, cfg: G1WalkFlatIMUGCCfg, num_envs=1, backend_type="mujoco"):
+        if cfg.reward_config is None:
+            raise ValueError("reward_config must be provided via Hydra configuration")
+
+        # Create backend
+        backend = create_backend(
+            backend_type,
+            cfg.scene,
+            num_envs,
+            cfg.sim_dt,
+            base_name=cfg.asset.base_name,
+            push_body_name=cfg.domain_rand.push_body_name,
+            motrix_max_iterations=cfg.motrix_max_iterations,
+            post_step_forward_sensor=cfg.post_step_forward_sensor,
+        )
+
+        # Switch MuJoCo position actuators → motor actuators before materialization
+        from unilab.control.actuator_switch import switch_to_motor_actuators
+        from unilab.control.pinocchio_model import PinocchioDynamicsModel
+
+        actuator_info = switch_to_motor_actuators(backend._model)
+        dynamics_model = PinocchioDynamicsModel(backend._model)
+
+        super().__init__(cfg, backend, num_envs)
+
+        # --- G1WalkEnv setup (replicated from G1WalkFlatGCEvn) ---
+        self._enable_reward_log = True
+        self._reward_cfg = cfg.reward_config
+
+        self._gait_phase_delta = float(
+            2.0 * math.pi * self._reward_cfg.gait_frequency * cfg.ctrl_dt
+        )
+        self._pose_weights = np.array(self._reward_cfg.pose_weights, dtype=get_global_dtype())
+        if self._pose_weights.shape[0] != self._num_action:
+            raise ValueError("pose_weights length mismatch")
+        self._upper_body_pose_weights = build_upper_body_pose_weights(self._reward_cfg.pose_weights)
+
+        # Episode length tracking / curriculum
+        self._episode_tracker: EpisodeLengthTracker | None = None
+        self._penalty_curriculum: PenaltyCurriculum | None = None
+        if cfg.curriculum.enabled:
+            self._episode_tracker = EpisodeLengthTracker(num_envs)
+            self._penalty_curriculum = PenaltyCurriculum(
+                self,
+                enabled=True,
+                initial_scale=cfg.curriculum.initial_scale,
+                min_scale=cfg.curriculum.min_scale,
+                max_scale=cfg.curriculum.max_scale,
+                level_down_threshold=cfg.curriculum.level_down_threshold,
+                level_up_threshold=cfg.curriculum.level_up_threshold,
+                degree=cfg.curriculum.degree,
+            )
+
+        self._init_reward_functions()
+
+        # --- Motor actuator specific setup ---
+        num_actions = self._num_action
+        self._base_motor_kp = actuator_info.kp.copy()
+        self._base_motor_kd = actuator_info.kd.copy()
+        self._motor_kp = np.broadcast_to(self._base_motor_kp, (num_envs, num_actions)).copy()
+        self._motor_kd = np.broadcast_to(self._base_motor_kd, (num_envs, num_actions)).copy()
+        self._force_lower = actuator_info.force_lower.copy()
+        self._force_upper = actuator_info.force_upper.copy()
+
+        # IMU-GC compensation setup
+        imu_gc_config = cfg.control_config
+        gravity_comp_mask = None
+        if imu_gc_config.gravity_comp_mask is not None:
+            gravity_comp_mask = np.asarray(imu_gc_config.gravity_comp_mask, dtype=np.float64)
+            if gravity_comp_mask.shape[0] != num_actions:
+                raise ValueError(
+                    f"gravity_comp_mask length ({gravity_comp_mask.shape[0]}) "
+                    f"must match num_actions ({num_actions})"
+                )
+
+        # Build the IMU-enhanced GC controller
+        from unilab.control.imu_gc_controller import IMUGravityCompController
+
+        self._controller = IMUGravityCompController(
+            dynamics_model=dynamics_model,
+            kp=self._base_motor_kp,
+            kd=self._base_motor_kd,
+            force_lower=self._force_lower,
+            force_upper=self._force_upper,
+            gravity_comp_mask=gravity_comp_mask,
+            gravity_scale=imu_gc_config.gravity_scale,
+            swing_boost=imu_gc_config.swing_boost,
+            disturbance_scale=imu_gc_config.disturbance_scale,
+        )
+        self._dynamics_model = dynamics_model
+        self._last_motor_ctrl = np.zeros((num_envs, num_actions), dtype=get_global_dtype())
+
+        # Pre-compute site IDs and DoF indices for IMU Jacobian
+        import mujoco as _mj
+
+        mj_model = backend._model
+        self._pelvis_imu_site_id = _mj.mj_name2id(
+            mj_model, _mj.mjtObj.mjOBJ_SITE, "imu_in_pelvis"
+        )
+        self._actuated_dof_indices = np.arange(6, mj_model.nv, dtype=np.int32)
+
+        # Total robot mass for IMU residual force estimation
+        self._robot_mass = float(np.sum(mj_model.body_mass))
+
+        # Store config values for pre_step_motor_control
+        self._disturbance_threshold = imu_gc_config.disturbance_threshold
+
+        # Pre-allocate buffers
+        self._swing_mask_buffer: np.ndarray | None = None
+        self._tau_disturbance_buffer: np.ndarray | None = None
+        self._gait_phase: np.ndarray = np.zeros((num_envs, 2), dtype=get_global_dtype())
+
+        # Register pre_step_control callback
+        self._backend.set_pre_step_control(self._pre_step_motor_control)
+
+        # DR: kp/kd handled by env, not backend
+        dr_provider = G1WalkGCDomainRandomizationProvider(
+            base_kp=self._base_motor_kp, base_kd=self._base_motor_kd
+        )
+        self._init_domain_randomization(dr_provider)
+
+    def _init_action_space(self) -> None:
+        import gymnasium as gym
+
+        nu = self._backend.num_actuators
+        self._action_space = gym.spaces.Box(-1.0, 1.0, (nu,), dtype=np.float32)
+
+    @property
+    def obs_groups_spec(self) -> dict[str, int]:
+        # Same as G1WalkFlat for fair comparison
+        return {"obs": 98, "critic": 101}
+
+    def _init_reward_functions(self):
+        self._reward_fns: dict[str, Any] = {
+            "tracking_lin_vel": rewards.tracking_lin_vel,
+            "tracking_ang_vel": rewards.tracking_ang_vel,
+            "forward_progress": rewards.forward_progress,
+            "under_speed": rewards.under_speed,
+            "lin_vel_z": rewards.lin_vel_z,
+            "orientation": rewards.orientation,
+            "penalty_orientation": rewards.orientation,
+            "ang_vel_xy": rewards.ang_vel_xy,
+            "penalty_ang_vel_xy": rewards.ang_vel_xy,
+            "action_rate": rewards.action_rate,
+            "penalty_action_rate": rewards.action_rate,
+            "base_height": rewards.base_height,
+            "pose": rewards.weighted_pose,
+            "upper_body_pose": self._reward_upper_body_pose,
+            "penalty_close_feet_xy": self._reward_close_feet_xy,
+            "penalty_feet_ori": self._reward_feet_ori,
+            "feet_phase": self._reward_feet_phase,
+            "feet_phase_contrast": self._reward_feet_phase_contrast,
+            "feet_phase_contact": self._reward_feet_phase_contact,
+            "feet_double_stance": self._reward_feet_double_stance,
+            "feet_air_time": self._reward_feet_air_time,
+            "alive": rewards.alive,
+        }
+
+    def sample_reset_motor_gains(self, num_reset: int) -> tuple[np.ndarray, np.ndarray]:
+        kp = np.broadcast_to(self._base_motor_kp, (num_reset, self._num_action)).copy()
+        kd = np.broadcast_to(self._base_motor_kd, (num_reset, self._num_action)).copy()
+        domain_rand = self._cfg.domain_rand
+        if domain_rand.randomize_kp:
+            low, high = domain_rand.kp_multiplier_range
+            kp *= np.random.uniform(low, high, size=(num_reset, 1))
+        if domain_rand.randomize_kd:
+            low, high = domain_rand.kp_multiplier_range
+            kd *= np.random.uniform(low, high, size=(num_reset, 1))
+        return kp, kd
+
+    def set_motor_gains(self, env_ids: np.ndarray, kp: np.ndarray, kd: np.ndarray) -> None:
+        self._motor_kp[env_ids] = np.asarray(kp, dtype=np.float64)
+        self._motor_kd[env_ids] = np.asarray(kd, dtype=np.float64)
+
+    def update_state(self, state: NpEnvState) -> NpEnvState:
+        """Override to include IMU-GC-specific state updates."""
+        linvel = self.get_local_linvel()
+        gyro = self.get_gyro()
+        gravity = self._backend.get_sensor_data(self._cfg.sensor.upvector)
+        dof_pos = self.get_dof_pos()
+        dof_vel = self.get_dof_vel()
+
+        max_tilt_rad = np.deg2rad(self._reward_cfg.max_tilt_deg)
+        tilt = np.arccos(np.clip(gravity[:, 2], -1, 1))
+        terminated = np.logical_or(
+            tilt > max_tilt_rad,
+            self._terrain_relative_base_height() < self._reward_cfg.min_base_height,
+        )
+
+        reward = self._compute_reward(state.info, linvel, gyro, gravity, dof_pos, dof_vel)
+        obs = self._compute_obs(state.info, linvel, gyro, gravity, dof_pos, dof_vel)
+        state = state.replace(obs=obs, reward=reward, terminated=terminated)
+
+        # Store torques in info
+        state.info["torques"] = self._last_motor_ctrl.copy()
+
+        done = state.terminated | state.truncated
+        if self._episode_tracker is None or self._penalty_curriculum is None or not np.any(done):
+            return state
+
+        done_indices = np.where(done)[0]
+        episode_lengths = state.info["steps"][done_indices] + 1
+        self._episode_tracker.update(episode_lengths)
+        self._penalty_curriculum.update(self._episode_tracker.average_length)
+
+        if "log" not in state.info:
+            state.info["log"] = {}
+        state.info["log"]["curriculum/average_episode_length"] = float(
+            self._episode_tracker.average_length
+        )
+        state.info["log"]["curriculum/penalty_scale"] = float(
+            self._penalty_curriculum.current_scale
+        )
+        return state
+
+    def _terrain_relative_base_height(self) -> np.ndarray:
+        return np.asarray(self._backend.get_base_pos()[:, 2], dtype=get_global_dtype())
+
+    def _uses_walk_observation_profile(self) -> bool:
+        scales = getattr(getattr(self, "_reward_cfg", None), "scales", None)
+        if scales is not None:
+            if any(
+                key in scales
+                for key in (
+                    "penalty_orientation",
+                    "penalty_ang_vel_xy",
+                    "penalty_action_rate",
+                    "alive",
+                )
+            ):
+                return True
+            if any(key in scales for key in ("orientation", "ang_vel_xy", "action_rate")):
+                return False
+        curriculum = getattr(self._cfg, "curriculum", None)
+        return bool(curriculum is not None and curriculum.enabled)
+
+    def _actor_symmetry_obs_layout(self) -> SymmetryObsLayout:
+        return (
+            ("gyro", 3),
+            ("gravity", 3),
+            ("dof_pos", self._num_action),
+            ("dof_vel", self._num_action),
+            ("actions", self._num_action),
+            ("command", 3),
+            ("gait_phase", 2),
+        )
+
+    def get_symmetry_obs_layouts(self) -> dict[str, SymmetryObsLayout]:
+        actor_layout = self._actor_symmetry_obs_layout()
+        return {
+            "obs": actor_layout,
+            "critic": (*actor_layout, ("linvel", 3)),
+        }
+
+    def build_symmetry_augmentation(self, *, device: str):
+        if self._backend.backend_type != "mujoco":
+            return None
+        from unilab.envs.locomotion.g1.symmetry import G1SymmetryAugmentation
+
+        return G1SymmetryAugmentation(
+            self._backend.model,
+            self.get_symmetry_obs_layouts(),
+            device=device,
+        )
+
+    def _compute_obs(
+        self, info: dict, linvel, gyro, gravity, dof_pos, dof_vel
+    ) -> dict[str, np.ndarray]:
+        noise_cfg = self._cfg.noise_config
+        diff = dof_pos - self.default_angles
+        command = info["commands"]
+        last_actions = info.get("current_actions", np.zeros_like(diff))
+        gait_phase = info.get("gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype()))
+        walk_profile = self._uses_walk_observation_profile()
+
+        noisy_gyro = self._obs_noise(gyro, noise_cfg.scale_gyro)
+        noisy_gravity = self._obs_noise(gravity, noise_cfg.scale_gravity)
+        noisy_diff = self._obs_noise(diff, noise_cfg.scale_joint_angle)
+        noisy_dof_vel = self._obs_noise(dof_vel, noise_cfg.scale_joint_vel)
+        actor_gyro_scale = 0.25 if walk_profile else 1.0
+        actor_dof_vel_scale = 0.05 if walk_profile else 1.0
+
+        actor = np.concatenate(
+            [
+                noisy_gyro * actor_gyro_scale,
+                -noisy_gravity,
+                noisy_diff,
+                noisy_dof_vel * actor_dof_vel_scale,
+                last_actions,
+                command,
+                gait_phase,
+            ],
+            axis=1,
+            dtype=get_global_dtype(),
+        )
+
+        critic_gyro_scale = 0.25 if walk_profile else 1.0
+        critic_dof_vel_scale = 0.05 if walk_profile else 1.0
+        critic_linvel_scale = 2.0 if walk_profile else 1.0
+        critic_base = np.concatenate(
+            [
+                gyro * critic_gyro_scale,
+                -gravity,
+                diff,
+                dof_vel * critic_dof_vel_scale,
+                last_actions,
+                command,
+                gait_phase,
+            ],
+            axis=1,
+            dtype=get_global_dtype(),
+        )
+        critic = np.concatenate(
+            [
+                critic_base,
+                np.asarray(linvel * critic_linvel_scale, dtype=get_global_dtype()),
+            ],
+            axis=1,
+            dtype=get_global_dtype(),
+        )
+
+        return {"obs": actor, "critic": critic}
+
+    def _build_reward_context(
+        self, info: dict, linvel, gyro, gravity, dof_pos, dof_vel
+    ) -> RewardContext:
+        return RewardContext(
+            info=info,
+            linvel=linvel,
+            gyro=gyro,
+            dof_pos=dof_pos,
+            num_envs=self._num_envs,
+            default_angles=self.default_angles,
+            tracking_sigma=self._reward_cfg.tracking_sigma,
+            base_height_target=self._reward_cfg.base_height_target,
+            base_height=self._backend.get_base_pos()[:, 2],
+            gravity=gravity,
+            dof_vel=dof_vel,
+            pose_weights=self._pose_weights,
+        )
+
+    def _compute_reward(self, info: dict, linvel, gyro, gravity, dof_pos, dof_vel) -> np.ndarray:
+        cfg = self._reward_cfg
+        ctx = self._build_reward_context(info, linvel, gyro, gravity, dof_pos, dof_vel)
+        return rewards.run_reward_dispatch(
+            scales=cfg.scales,
+            fns=self._reward_fns,
+            ctx=ctx,
+            info=info,
+            enable_log=self._enable_reward_log,
+            ctrl_dt=self._cfg.ctrl_dt,
+        )
+
+    # --- Reward methods (same as G1WalkFlatGCEvn) ---
+
+    def _gait_reward_gate(self, linvel: np.ndarray) -> np.ndarray:
+        min_forward_speed = getattr(self._reward_cfg, "min_forward_speed_for_gait_reward", 0.0)
+        return compute_forward_speed_gate(linvel, min_forward_speed)
+
+    def _reward_feet_phase(self, ctx: RewardContext):
+        left_foot = self._backend.get_sensor_data("left_foot_pos")
+        right_foot = self._backend.get_sensor_data("right_foot_pos")
+        gait_phase = ctx.info.get(
+            "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        swing_height = self._reward_cfg.feet_phase_swing_height
+        left_target, right_target = compute_feet_phase_height_targets(gait_phase, swing_height)
+        left_error = np.square(left_foot[:, 2] - left_target)
+        right_error = np.square(right_foot[:, 2] - right_target)
+        reward = np.exp(-(left_error + right_error) / self._reward_cfg.feet_phase_tracking_sigma)
+        return np.asarray(reward * self._gait_reward_gate(ctx.linvel), dtype=get_global_dtype())
+
+    def _reward_feet_phase_contrast(self, ctx: RewardContext):
+        left_foot = self._backend.get_sensor_data("left_foot_pos")
+        right_foot = self._backend.get_sensor_data("right_foot_pos")
+        gait_phase = ctx.info.get(
+            "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        swing_height = self._reward_cfg.feet_phase_swing_height
+        left_target, right_target = compute_feet_phase_height_targets(gait_phase, swing_height)
+        actual_delta = left_foot[:, 2] - right_foot[:, 2]
+        target_delta = left_target - right_target
+        error = np.square(actual_delta - target_delta)
+        reward = np.exp(-error / self._reward_cfg.feet_phase_tracking_sigma)
+        return np.asarray(reward * self._gait_reward_gate(ctx.linvel), dtype=get_global_dtype())
+
+    def _reward_feet_phase_contact(self, ctx: RewardContext):
+        gait_phase = ctx.info.get(
+            "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        swing_height = self._reward_cfg.feet_phase_swing_height
+        left_target_contact, right_target_contact = compute_feet_phase_contact_targets(
+            gait_phase, swing_height
+        )
+        left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        left_match = np.asarray(left_contact == left_target_contact, dtype=get_global_dtype())
+        right_match = np.asarray(right_contact == right_target_contact, dtype=get_global_dtype())
+        reward = np.asarray(0.5 * (left_match + right_match), dtype=get_global_dtype())
+        return np.asarray(reward * self._gait_reward_gate(ctx.linvel), dtype=get_global_dtype())
+
+    def _reward_feet_double_stance(self, ctx: RewardContext):
+        commands = ctx.info.get("commands", np.zeros((self._num_envs, 3), dtype=get_global_dtype()))
+        left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        double_stance = np.asarray(
+            np.logical_and(left_contact, right_contact), dtype=get_global_dtype()
+        )
+        return np.asarray(
+            double_stance * compute_forward_command_mask(commands), dtype=get_global_dtype()
+        )
+
+    def _reward_feet_ori(self, ctx: RewardContext):
+        left_foot_quat = self._backend.get_sensor_data("left_foot_quat")
+        right_foot_quat = self._backend.get_sensor_data("right_foot_quat")
+        return (
+            np.square(left_foot_quat[:, 1])
+            + np.square(left_foot_quat[:, 2])
+            + np.square(right_foot_quat[:, 1])
+            + np.square(right_foot_quat[:, 2])
+        )
+
+    def _reward_close_feet_xy(self, ctx: RewardContext):
+        left_foot = self._backend.get_sensor_data("left_foot_pos")
+        right_foot = self._backend.get_sensor_data("right_foot_pos")
+        feet_dist = np.linalg.norm(left_foot[:, :2] - right_foot[:, :2], axis=1)
+        return np.where(
+            feet_dist < self._reward_cfg.close_feet_threshold,
+            np.square(feet_dist - self._reward_cfg.close_feet_threshold),
+            0.0,
+        )
+
+    def _reward_feet_air_time(self, ctx: RewardContext):
+        air_time = ctx.info.get(
+            "feet_air_time", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        in_range = (air_time > 0.05) & (air_time < 0.5)
+        return np.sum(in_range.astype(float), axis=1)
+
+    def _reward_upper_body_pose(self, ctx: RewardContext):
+        diff = ctx.dof_pos - self.default_angles
+        return np.asarray(
+            np.sum(self._upper_body_pose_weights * np.square(diff), axis=1),
+            dtype=get_global_dtype(),
+        )
+
+    def _compute_imu_signals(
+        self, backend: Any, gait_phase: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute IMU-driven swing mask and disturbance torque.
+
+        Returns:
+            swing_mask_per_env: (num_envs, num_actions) — 1.0 for swing-leg joints
+            tau_disturbance: (num_envs, num_actions) — disturbance correction torque
+        """
+        num_envs = self._num_envs
+        num_actions = self._num_action
+
+        # ── 1. IMU residual acceleration ────────────────────────────
+        accel_local = backend.get_sensor_data("pelvis_acceleration")  # (N, 3)
+        full_qpos = backend.get_full_qpos()
+        qw, qx, qy, qz = full_qpos[:, 3], full_qpos[:, 4], full_qpos[:, 5], full_qpos[:, 6]
+
+        # Quaternion → rotation matrix
+        R = np.zeros((num_envs, 3, 3), dtype=np.float64)
+        R[:, 0, 0] = 1 - 2 * (qy * qy + qz * qz)
+        R[:, 0, 1] = 2 * (qx * qy - qw * qz)
+        R[:, 0, 2] = 2 * (qx * qz + qw * qy)
+        R[:, 1, 0] = 2 * (qx * qy + qw * qz)
+        R[:, 1, 1] = 1 - 2 * (qx * qx + qz * qz)
+        R[:, 1, 2] = 2 * (qy * qz - qw * qx)
+        R[:, 2, 0] = 2 * (qx * qz - qw * qy)
+        R[:, 2, 1] = 2 * (qy * qz + qw * qx)
+        R[:, 2, 2] = 1 - 2 * (qx * qx + qy * qy)
+
+        # Residual acceleration: R · a_sensor - g_up
+        accel_world = np.einsum("eij,ej->ei", R, accel_local)
+        accel_world[:, 2] -= 9.81
+
+        # Residual force
+        f_residual = self._robot_mass * accel_world  # (N, 3)
+
+        # ── 2. Swing-leg detection: gait_phase + IMU cross-validation ──
+        # gait_phase convention: phase ∈ (π, 2π) → swing, [0, π] → stance
+        left_swing_by_phase = gait_phase[:, 0] > np.pi   # (N,)
+        right_swing_by_phase = gait_phase[:, 1] > np.pi  # (N,)
+
+        # IMU cross-validation: if vertical residual force > mg/2, foot is likely in stance
+        # (stance foot bears ~half body weight, giving a large downward residual)
+        stance_force_threshold = 0.5 * self._robot_mass * 9.81
+        imu_says_stance = f_residual[:, 2] < -stance_force_threshold  # (N,)
+
+        # Final: swing = gait says swing AND NOT IMU says stance
+        left_swing = left_swing_by_phase & ~imu_says_stance
+        right_swing = right_swing_by_phase & ~imu_says_stance
+
+        # ── 3. Build swing mask per env ─────────────────────────────
+        # G1 joint order: left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7)
+        if self._swing_mask_buffer is None or self._swing_mask_buffer.shape != (num_envs, num_actions):
+            self._swing_mask_buffer = np.zeros((num_envs, num_actions), dtype=np.float64)
+
+        swing_mask = self._swing_mask_buffer
+        swing_mask[:] = 0.0
+        swing_mask[left_swing, 0:6] = 1.0   # left leg
+        swing_mask[right_swing, 6:12] = 1.0  # right leg
+        # waist (12:15) and arms (15:29) stay 0
+
+        # ── 4. Disturbance correction (gated) ──────────────────────
+        Jp_pelvis, _ = backend.get_site_jacobian_w(
+            self._pelvis_imu_site_id, self._actuated_dof_indices
+        )
+        tau_raw = np.einsum("ejk,ej->ek", Jp_pelvis, f_residual)  # (N, num_actions)
+
+        # Gate: only activate when residual exceeds threshold
+        residual_norm = np.linalg.norm(f_residual, axis=-1)  # (N,)
+        active = residual_norm > self._disturbance_threshold  # (N,)
+
+        if self._tau_disturbance_buffer is None or self._tau_disturbance_buffer.shape != (num_envs, num_actions):
+            self._tau_disturbance_buffer = np.zeros((num_envs, num_actions), dtype=np.float64)
+
+        tau_disturbance = self._tau_disturbance_buffer
+        tau_disturbance[:] = 0.0
+        tau_disturbance[active] = tau_raw[active]
+
+        return swing_mask, tau_disturbance
+
+    def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
+        state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
+        state.info["current_actions"] = actions
+
+        gait_phase = state.info.get(
+            "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        gait_phase[:, 0] = (gait_phase[:, 0] + self._gait_phase_delta) % (2 * np.pi)
+        gait_phase[:, 1] = (gait_phase[:, 1] + self._gait_phase_delta) % (2 * np.pi)
+        state.info["gait_phase"] = gait_phase
+
+        # Store for access in _pre_step_motor_control (which doesn't receive state)
+        self._gait_phase = gait_phase
+
+        ctrl: np.ndarray = actions * self._cfg.control_config.action_scale + self.default_angles
+        return ctrl
+
+    def _pre_step_motor_control(self, backend: Any, policy_ctrl: np.ndarray) -> np.ndarray:
+        """Pre-step callback: IMU-enhanced gravity compensation.
+
+        τ = PD + gravity_scale·g(q)·(mask + swing_boost·swing_mask)
+            + disturbance_scale·τ_disturbance
+        """
+        self._dynamics_model.invalidate_cache()
+
+        joint_pos = backend.get_dof_pos()
+        joint_vel = backend.get_dof_vel()
+        full_qpos = backend.get_full_qpos()
+        full_qvel = backend.get_full_qvel()
+
+        # Get gait_phase (stored by apply_action)
+        gait_phase = getattr(
+            self, "_gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+
+        # Compute IMU-driven signals
+        swing_mask, tau_disturbance = self._compute_imu_signals(backend, gait_phase)
+
+        # Update controller gains (may have been randomized by DR at reset)
+        self._controller.kp = self._motor_kp
+        self._controller.kd = self._motor_kd
+
+        # Compute motor torques
+        motor_ctrl = self._controller.compute(
+            policy_ctrl,
+            joint_pos,
+            joint_vel,
+            full_qpos=full_qpos,
+            full_qvel=full_qvel,
+            swing_mask_per_env=swing_mask,
+            tau_disturbance=tau_disturbance,
+        )
+        self._last_motor_ctrl = motor_ctrl
+        return motor_ctrl
