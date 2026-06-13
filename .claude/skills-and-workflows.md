@@ -562,3 +562,11 @@ GC 力矩 = `gravity_scale × g(q)`，其中 g(q) 由 Pinocchio 根据URDF 质�
 ```
 
 **教训**：模型预测 r_max≈342，实际 10k 时仅 325.9。不可用此模型做远期决策。
+
+### 8.8 动力学补偿符号 Bug（关键教训）
+
+22. **Pinocchio g(q) 在 MuJoCo motor actuator 中的符号**：`g(q) == qfrc_bias`（数值一致），但在 motor actuator 中 `τ = ctrl`，动力学为 `Mq̈ = ctrl - qfrc_bias + qfrc_constraint`。正确的 GC 应为 `ctrl = PD + g(q) - τ_contact`（加 g(q) 抵消 qfrc_bias，减 τ_contact 抵消 qfrc_constraint）。当前代码 `ctrl = PD - g(q) + τ_contact` 符号反了
+23. **"负重训练"效应**：符号反的 GC 等效于 2×g(q) 负重，策略被迫更强力但跟踪更差。之前认为"GC 过补偿有益"是错误结论——实际是 Bug 产生的虚高 reward
+24. **IMU disturbance correction 符号也反了**：`f_residual` 检测到"意外加速度"时应施加反向力矩抵消（`-= `），而非顺着加力（`+=`）。与重力项同理
+25. **验证补偿符号的正确方法**：在 MuJoCo 中用 motor actuator 对比 `ctrl = PD ± g(q)` 的稳态跟踪误差。`PD - g(q)` 误差更小说明减法正确
+26. **Contact 项在修正后需反号**：在 `τ = PD + g(q)` 正确框架下，contact 项从减法变加法（`+= contact_scale × τ_contact`），因为接触力与重力方向相反
