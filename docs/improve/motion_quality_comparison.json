@@ -1,0 +1,26 @@
+{
+  "imugc": {
+    "task": "IMU-GC 96x2",
+    "mean_reward": 0.3428821563720703,
+    "height_mean": 0.7363085746765137,
+    "height_std": 0.012923325411975384,
+    "roll_std_deg": 3.6097376346588135,
+    "pitch_std_deg": 1.7564668655395508,
+    "vel_smoothness": 0.30722740292549133,
+    "leg_vel_smoothness": 0.5860885381698608,
+    "action_smoothness": 0.03513219952583313,
+    "leg_action_smoothness": 0.059966791421175
+  },
+  "baseline": {
+    "task": "Baseline 96x2",
+    "mean_reward": 0.29626548290252686,
+    "height_mean": 0.7735193371772766,
+    "height_std": 0.01498552318662405,
+    "roll_std_deg": 4.7170844078063965,
+    "pitch_std_deg": 1.719330906867981,
+    "vel_smoothness": 0.4268236756324768,
+    "leg_vel_smoothness": 0.7436000108718872,
+    "action_smoothness": 0.054682884365320206,
+    "leg_action_smoothness": 0.08171165734529495
+  }
+}

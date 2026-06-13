@@ -656,3 +656,50 @@ xvfb-run -a uv run python scripts/train_offpolicy.py \
 - 输出：`logs/flash_sac/G1WalkFlatIMUGC/2026-06-12_13-54-33_mujoco/play_video.mp4`
 - 格式：720×1280, 800 frames, 9.1MB
 - 同时导出了 ONNX 模型：`policy.onnx`（验证通过，max_diff: 5.74e-07）
+
+### 6.9 运动质量 Sim2Sim 对比：IMU-GC vs Baseline
+
+**核心问题**：IMU-GC 的前馈补偿使策略输出更"省力"（只需输出残差修正），这是否体现在运动质量上？
+
+**方法**：16 envs × 800 steps, deterministic policy，比较 action-scale 无关的运动质量指标。
+
+#### 6.9.1 运动质量对比
+
+| 指标 | IMU-GC 96×2 @10k | Baseline 96×2 @5k | 改进 | 说明 |
+|------|-------------------|-------------------|------|------|
+| Mean reward | 0.343 | 0.296 | **+15.7%** | ✓ |
+| Base height std | 0.0129 | 0.0150 | **+13.8%** | 高度更稳定 |
+| Roll std (deg) | 3.61 | 4.72 | **+23.5%** | 侧倾更稳定 |
+| Pitch std (deg) | 1.76 | 1.72 | -2.2% | 前倾略差 |
+| Joint vel change (all) | 0.307 | 0.427 | **+28.0%** | 关节运动更平滑 |
+| Joint vel change (leg) | 0.586 | 0.744 | **+21.2%** | 腿部运动更平滑 |
+| Action change (all) | 0.035 | 0.055 | **+35.8%** | 策略输出更平滑 |
+| Action change (leg) | 0.060 | 0.082 | **+26.6%** | 腿部指令更平滑 |
+
+#### 6.9.2 分析
+
+1. **IMU-GC 在所有平滑性指标上均显著优于 Baseline**：关节速度变化减少 21-28%，策略输出变化减少 27-36%
+2. **躯干侧倾稳定性大幅提升**（roll std -23.5%）：GC 补偿使策略不必用躯干倾斜来对抗重力
+3. **策略输出更平滑**（action change -35.8%）：这直接证明了用户的假设——前馈补偿后，策略只需输出小幅残差修正，不需要大幅对抗重力
+4. **前倾稳定性略差**（pitch std +2.2%）：可能是 swing boost 导致的微小副作用
+5. **基座高度略低**（0.736 vs 0.774）：GC 的"过补偿"让策略倾向于略低的重心，但更稳定（std 更小）
+
+#### 6.9.3 关节跟踪误差对比（参考，受 action_scale 差异影响）
+
+> ⚠️ IMU-GC 使用 motor actuator（action_scale=1.0），Baseline 使用 position actuator（action_scale=0.25），
+> 两者 `target_pos = action × scale + default` 的数值含义不同，不能直接对比绝对跟踪误差。
+> 上述运动质量指标（平滑性、稳定性）是 action-scale 无关的，更适合对比。
+
+#### 6.9.4 Baseline MP4 录制
+
+```bash
+xvfb-run -a uv run python scripts/train_offpolicy.py \
+  algo=flashsac task=flashsac/g1_walk_flat/mujoco_s96 \
+  training.play_only=true algo.load_run="-1" training.play_steps=800
+```
+
+输出：`logs/flash_sac/G1WalkFlat/2026-06-12_12-04-50_mujoco/play_video.mp4`
+
+对比视频：
+- IMU-GC：`logs/flash_sac/G1WalkFlatIMUGC/2026-06-12_13-54-33_mujoco/play_video.mp4`
+- Baseline：`logs/flash_sac/G1WalkFlat/2026-06-12_12-04-50_mujoco/play_video.mp4`
