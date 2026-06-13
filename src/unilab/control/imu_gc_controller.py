@@ -130,14 +130,11 @@ class IMUGravityCompController(MotorController):
             if self._swing_boost != 0.0 and swing_mask_per_env is not None:
                 effective_mask = effective_mask + self._swing_boost * swing_mask_per_env
 
-            # Correct sign: SUBTRACT g(q) to cancel qfrc_bias, SUBTRACT disturbance to cancel qfrc_constraint
-            # MuJoCo dynamics: Mq̈ = ctrl - qfrc_bias + qfrc_constraint
-            # For PD tracking: ctrl = PD + g(q) - τ_contact  (g(q)=qfrc_bias, τ_contact≈qfrc_constraint)
-            self._out -= self._gravity_scale * tau_gravity * effective_mask
+            self._out += self._gravity_scale * tau_gravity * effective_mask
 
-        # Disturbance correction: SUBTRACT to cancel residual forces
+        # Disturbance correction
         if self._disturbance_scale != 0.0 and tau_disturbance is not None:
-            self._out -= self._disturbance_scale * tau_disturbance
+            self._out += self._disturbance_scale * tau_disturbance
 
         np.clip(self._out, self._force_lower, self._force_upper, out=self._out)
         return self._out

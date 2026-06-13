@@ -138,22 +138,20 @@ class ContactCompController(MotorController):
             tau_gravity = self._dynamics_model.gravity(full_qpos, full_qvel)
             if self._gravity_comp_mask is not None:
                 tau_gravity = tau_gravity * self._gravity_comp_mask
-            self._out -= self._gravity_scale * tau_gravity
+            self._out += self._gravity_scale * tau_gravity
 
             # Coriolis + centrifugal compensation: C(q,q̇)q̇
             tau_coriolis = self._dynamics_model.coriolis(full_qpos, full_qvel)
             if self._coriolis_comp_mask is not None:
                 tau_coriolis = tau_coriolis * self._coriolis_comp_mask
-            self._out -= self._coriolis_scale * tau_coriolis
+            self._out += self._coriolis_scale * tau_coriolis
 
-        # Contact force compensation: +contact_scale * τ_contact
-        # After fixing gravity to -= g(q), contact term flips from -= to +=
-        # because contact force opposes gravity (GRF supports the body)
+        # Contact force compensation: -contact_scale * J_c^T · F_contact
         if tau_contact is not None:
             tc = tau_contact
             if self._contact_comp_mask is not None:
                 tc = tc * self._contact_comp_mask
-            self._out += self._contact_scale * tc
+            self._out -= self._contact_scale * tc
 
         np.clip(self._out, self._force_lower, self._force_upper, out=self._out)
         return self._out

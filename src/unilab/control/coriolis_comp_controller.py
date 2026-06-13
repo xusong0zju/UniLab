@@ -115,13 +115,13 @@ class CoriolisCompController(MotorController):
             tau_gravity = self._dynamics_model.gravity(full_qpos, full_qvel)
             if self._gravity_comp_mask is not None:
                 tau_gravity = tau_gravity * self._gravity_comp_mask
-            self._out -= self._gravity_scale * tau_gravity
+            self._out += self._gravity_scale * tau_gravity
 
             # Coriolis + centrifugal compensation: C(q,q̇)q̇
             tau_coriolis = self._dynamics_model.coriolis(full_qpos, full_qvel)
             if self._coriolis_comp_mask is not None:
                 tau_coriolis = tau_coriolis * self._coriolis_comp_mask
-            self._out -= self._coriolis_scale * tau_coriolis
+            self._out += self._coriolis_scale * tau_coriolis
 
         np.clip(self._out, self._force_lower, self._force_upper, out=self._out)
         return self._out
