@@ -17,6 +17,10 @@ class CoriolisCompController(MotorController):
     - ``g(q)`` is the generalized gravity vector (Pinocchio RNEA with zero velocity/accel)
     - ``C(q,q̇)q̇`` is the Coriolis + centrifugal force vector
 
+    Adding g(q) and C(q,q̇)q̇ to the PD output cancels the corresponding
+    components of MuJoCo's ``qfrc_bias``, reducing the dynamics burden on
+    the policy.
+
     Compared to ``GravityCompController``, this additionally compensates for
     velocity-dependent coupling forces. At low speeds the Coriolis term is
     small and the controller degrades gracefully to gravity compensation; at

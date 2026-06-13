@@ -2472,8 +2472,8 @@ class G1WalkIMUGCControlConfig:
 
     Compared to G1WalkGCControlConfig, adds:
     - swing_boost: extra gravity compensation for swing-leg joints
-    - disturbance_scale: IMU residual disturbance correction strength
-    - disturbance_threshold: activation threshold for disturbance correction (N)
+    - imu_modulated_gravity: whether to modulate upper-body gravity compensation
+      based on IMU net acceleration (effective gravity in pelvis frame)
     """
 
     action_scale: float = 1.0
@@ -2481,8 +2481,7 @@ class G1WalkIMUGCControlConfig:
     gravity_comp_mask: list[float] | None = None
     gravity_scale: float = 1.0
     swing_boost: float = 0.0
-    disturbance_scale: float = 0.0
-    disturbance_threshold: float = 5.0
+    imu_modulated_gravity: bool = True
 
 
 @registry.envcfg("G1WalkFlatIMUGC")
@@ -2507,12 +2506,18 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
 
     Compared to G1WalkFlatGCEvn:
     1. Swing-leg gravity boost: swing legs receive extra GC (no GRF support)
-    2. Disturbance correction: IMU residual acceleration → correction torque,
-       gated by threshold to avoid weakening stance over-compensation
+    2. IMU-modulated gravity: upper-body GC is scaled by the effective gravity
+       factor derived from IMU net acceleration.  In the non-inertial pelvis
+       frame, the effective gravity is g_eff = g - a_pelvis, so:
+       - Standing (a_net_z≈0): factor=1.0 (full compensation)
+       - Free fall (a_net_z≈-9.81): factor=0.0 (no compensation needed)
+       - Pushed up (a_net_z>0): factor>1.0 (body feels heavier)
 
     Formula:
-        τ = PD + gravity_scale·g(q)·(mask + swing_boost·swing_mask)
-            + disturbance_scale·τ_disturbance
+        τ = PD + gravity_scale·g(q)·modulated_mask
+        where modulated_mask:
+        - Leg joints [0:12]: mask + swing_boost·swing_mask
+        - Upper body joints [12:]: mask · imu_gravity_factor
 
     Swing-leg detection uses gait_phase (from env) cross-validated with
     IMU residual acceleration (stance → large downward residual from GRF).
@@ -2607,7 +2612,6 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
             gravity_comp_mask=gravity_comp_mask,
             gravity_scale=imu_gc_config.gravity_scale,
             swing_boost=imu_gc_config.swing_boost,
-            disturbance_scale=imu_gc_config.disturbance_scale,
         )
         self._dynamics_model = dynamics_model
         self._last_motor_ctrl = np.zeros((num_envs, num_actions), dtype=get_global_dtype())
@@ -2625,11 +2629,10 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
         self._robot_mass = float(np.sum(mj_model.body_mass))
 
         # Store config values for pre_step_motor_control
-        self._disturbance_threshold = imu_gc_config.disturbance_threshold
+        self._imu_modulated_gravity = imu_gc_config.imu_modulated_gravity
 
         # Pre-allocate buffers
         self._swing_mask_buffer: np.ndarray | None = None
-        self._tau_disturbance_buffer: np.ndarray | None = None
         self._gait_phase: np.ndarray = np.zeros((num_envs, 2), dtype=get_global_dtype())
 
         # Register pre_step_control callback
@@ -2968,12 +2971,14 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
 
     def _compute_imu_signals(
         self, backend: Any, gait_phase: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute IMU-driven swing mask and disturbance torque.
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Compute IMU-driven swing mask and net acceleration.
 
         Returns:
             swing_mask_per_env: (num_envs, num_actions) — 1.0 for swing-leg joints
-            tau_disturbance: (num_envs, num_actions) — disturbance correction torque
+            imu_accel_net: (num_envs, 3) — net acceleration at pelvis in world frame.
+                a_net = R·a_sensor - [0,0,9.81].  Standing≈[0,0,0], free fall≈[0,0,-9.81].
+                None if imu_modulated_gravity is disabled.
         """
         num_envs = self._num_envs
         num_actions = self._num_action
@@ -2995,12 +3000,16 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
         R[:, 2, 1] = 2 * (qy * qz + qw * qx)
         R[:, 2, 2] = 1 - 2 * (qx * qx + qy * qy)
 
-        # Residual acceleration: R · a_sensor - g_up
+        # Net acceleration in world frame: R · a_sensor - g_up
+        # a_sensor measures specific force = a_actual - g (upward positive for support)
+        # After rotation and subtracting 9.81: a_net = a_actual (standing≈0, free fall≈-9.81)
         accel_world = np.einsum("eij,ej->ei", R, accel_local)
         accel_world[:, 2] -= 9.81
 
-        # Residual force
-        f_residual = self._robot_mass * accel_world  # (N, 3)
+        # Extract net vertical acceleration for IMU-modulated gravity
+        imu_accel_net_z: np.ndarray | None = None
+        if self._imu_modulated_gravity:
+            imu_accel_net_z = accel_world[:, 2].copy()  # (N,)
 
         # ── 2. Swing-leg detection: gait_phase + IMU cross-validation ──
         # gait_phase convention: phase ∈ (π, 2π) → swing, [0, π] → stance
@@ -3009,8 +3018,9 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
 
         # IMU cross-validation: if vertical residual force > mg/2, foot is likely in stance
         # (stance foot bears ~half body weight, giving a large downward residual)
+        f_residual_z = self._robot_mass * accel_world[:, 2]  # vertical residual force
         stance_force_threshold = 0.5 * self._robot_mass * 9.81
-        imu_says_stance = f_residual[:, 2] < -stance_force_threshold  # (N,)
+        imu_says_stance = f_residual_z < -stance_force_threshold  # (N,)
 
         # Final: swing = gait says swing AND NOT IMU says stance
         left_swing = left_swing_by_phase & ~imu_says_stance
@@ -3027,24 +3037,7 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
         swing_mask[right_swing, 6:12] = 1.0  # right leg
         # waist (12:15) and arms (15:29) stay 0
 
-        # ── 4. Disturbance correction (gated) ──────────────────────
-        Jp_pelvis, _ = backend.get_site_jacobian_w(
-            self._pelvis_imu_site_id, self._actuated_dof_indices
-        )
-        tau_raw = np.einsum("ejk,ej->ek", Jp_pelvis, f_residual)  # (N, num_actions)
-
-        # Gate: only activate when residual exceeds threshold
-        residual_norm = np.linalg.norm(f_residual, axis=-1)  # (N,)
-        active = residual_norm > self._disturbance_threshold  # (N,)
-
-        if self._tau_disturbance_buffer is None or self._tau_disturbance_buffer.shape != (num_envs, num_actions):
-            self._tau_disturbance_buffer = np.zeros((num_envs, num_actions), dtype=np.float64)
-
-        tau_disturbance = self._tau_disturbance_buffer
-        tau_disturbance[:] = 0.0
-        tau_disturbance[active] = tau_raw[active]
-
-        return swing_mask, tau_disturbance
+        return swing_mask, imu_accel_net_z
 
     def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
         state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
@@ -3066,8 +3059,10 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
     def _pre_step_motor_control(self, backend: Any, policy_ctrl: np.ndarray) -> np.ndarray:
         """Pre-step callback: IMU-enhanced gravity compensation.
 
-        τ = PD + gravity_scale·g(q)·(mask + swing_boost·swing_mask)
-            + disturbance_scale·τ_disturbance
+        τ = PD + gravity_scale·g(q)·modulated_mask
+        where modulated_mask:
+        - Leg joints [0:12]: mask + swing_boost·swing_mask
+        - Upper body joints [12:]: mask · imu_gravity_factor
         """
         self._dynamics_model.invalidate_cache()
 
@@ -3082,7 +3077,7 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
         )
 
         # Compute IMU-driven signals
-        swing_mask, tau_disturbance = self._compute_imu_signals(backend, gait_phase)
+        swing_mask, imu_accel_net_z = self._compute_imu_signals(backend, gait_phase)
 
         # Update controller gains (may have been randomized by DR at reset)
         self._controller.kp = self._motor_kp
@@ -3096,7 +3091,7 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
             full_qpos=full_qpos,
             full_qvel=full_qvel,
             swing_mask_per_env=swing_mask,
-            tau_disturbance=tau_disturbance,
+            imu_accel_net_z=imu_accel_net_z,
         )
         self._last_motor_ctrl = motor_ctrl
         return motor_ctrl

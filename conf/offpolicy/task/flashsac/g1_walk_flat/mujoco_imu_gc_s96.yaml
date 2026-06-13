@@ -1,13 +1,13 @@
 # @package _global_
 # G1 Walk with IMU-Enhanced GC — Actor hidden=96, blocks=2 (58% params)
-# Testing: does good feedforward allow smaller policy?
+# IMU usage: modulate upper-body gravity compensation based on net acceleration
 training:
   task_name: G1WalkFlatIMUGC
   sim_backend: mujoco
 algo:
   num_envs: 4096
   learning_starts: 49
-  max_iterations: 5000
+  max_iterations: 10000
   save_interval: 1000
   updates_per_step: 8
   replay_buffer_n: 256
@@ -23,8 +23,7 @@ env:
     gravity_comp_mask: [1,1,1,1,1,1, 1,1,1,1,1,1, 1,1,1, 0,0,0,0,0,0,0, 0,0,0,0,0,0,0]
     gravity_scale: 1.0
     swing_boost: 0.3
-    disturbance_scale: 0.2
-    disturbance_threshold: 5.0
+    imu_modulated_gravity: true
   gait_phase_init_mode: "offset_phase"
   reset_base_qvel_limit: 0.5
   curriculum:

@@ -4,9 +4,9 @@
     - contact_scale * J_c^T · F_contact
 
 This extends CoriolisCompController by additionally compensating for the
-joint-space contribution of foot contact forces.  The contact force term
-is the largest uncompensated residual after CC compensation — the
-diagnostic shows it is ~4× the magnitude of gravity for G1 walking.
+joint-space contribution of foot contact forces.  Adding g(q) and C(q,q̇)q̇
+cancels qfrc_bias; subtracting the contact contribution reduces the stance
+over-compensation where GRF already supports the body against gravity.
 
 The contact Jacobian J_c and foot forces F are obtained from the MuJoCo
 backend at each substep.  A per-joint mask allows selective compensation
@@ -31,6 +31,10 @@ class ContactCompController(MotorController):
 
     τ = PD + gravity_scale·g(q) + coriolis_scale·C(q,q̇)q̇
         - contact_scale·J_c^T·F_contact
+
+    Adding g(q) and C(q,q̇)q̇ cancels the bias forces (qfrc_bias).
+    For stance legs, GRF already counteracts gravity; subtracting the
+    contact contribution reduces the stance over-compensation.
 
     The contact force contribution J_c^T·F_contact is computed from
     the MuJoCo backend's site Jacobians and foot force sensors.
@@ -147,6 +151,8 @@ class ContactCompController(MotorController):
             self._out += self._coriolis_scale * tau_coriolis
 
         # Contact force compensation: -contact_scale * J_c^T · F_contact
+        # For stance legs, GRF already supports against gravity; subtracting
+        # the contact contribution reduces the stance over-compensation.
         if tau_contact is not None:
             tc = tau_contact
             if self._contact_comp_mask is not None:

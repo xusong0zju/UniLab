@@ -14,8 +14,15 @@ class GravityCompController(MotorController):
     τ = kp * (q_d - q) - kd * q̇ + gravity_scale * g(q)
 
     The gravity term ``g(q)`` is computed by Pinocchio's RNEA algorithm
-    (with zero velocity and acceleration), ensuring consistency with the
-    rigid-body dynamics model used at deployment time.
+    (with zero velocity and acceleration).  In the RNEA convention,
+    ``g(q)`` is the torque needed to **support** the robot against gravity,
+    and adding it to the PD output cancels the gravity component of
+    MuJoCo's ``qfrc_bias``, leaving the PD controller to work in a
+    partially gravity-free space.
+
+    For stance legs (with ground contact), GRF partially counteracts gravity,
+    so full g(q) compensation is an "over-compensation" that effectively
+    lightens the stance legs — beneficial for learning to walk.
 
     An optional ``gravity_comp_mask`` selects which joints receive gravity
     compensation. For the G1 humanoid, this is useful to skip arm joints

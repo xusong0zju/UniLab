@@ -28,7 +28,6 @@ def resolve_controller(
     contact_comp_mask: Any = None,
     contact_scale: float = 1.0,
     swing_boost: float = 0.0,
-    disturbance_scale: float = 0.0,
 ) -> MotorController:
     """Create a MotorController by name.
 
@@ -48,6 +47,7 @@ def resolve_controller(
         contact_comp_mask: Binary mask for selective contact compensation.
             Defaults to gravity_comp_mask if not specified.
         contact_scale: Scaling factor for the contact force compensation term.
+        swing_boost: Extra gravity compensation for swing-leg joints (imu_gc only).
 
     Returns:
         A MotorController instance.
@@ -129,7 +129,6 @@ def resolve_controller(
             gravity_comp_mask=mask,
             gravity_scale=gravity_scale,
             swing_boost=swing_boost,
-            disturbance_scale=disturbance_scale,
         )
 
     if name == "ctc":
