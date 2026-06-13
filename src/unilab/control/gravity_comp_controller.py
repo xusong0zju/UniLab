@@ -95,7 +95,7 @@ class GravityCompController(MotorController):
             tau_gravity = self._dynamics_model.gravity(full_qpos, full_qvel)
             if self._gravity_comp_mask is not None:
                 tau_gravity = tau_gravity * self._gravity_comp_mask
-            self._out += self._gravity_scale * tau_gravity
+            self._out -= self._gravity_scale * tau_gravity
 
         np.clip(self._out, self._force_lower, self._force_upper, out=self._out)
         return self._out
