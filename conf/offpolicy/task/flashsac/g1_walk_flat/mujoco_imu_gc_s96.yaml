@@ -23,7 +23,7 @@ env:
     gravity_comp_mask: [1,1,1,1,1,1, 1,1,1,1,1,1, 1,1,1, 0,0,0,0,0,0,0, 0,0,0,0,0,0,0]
     gravity_scale: 1.0
     swing_boost: 0.3
-    imu_modulated_gravity: true
+    imu_modulated_gravity: false
   gait_phase_init_mode: "offset_phase"
   reset_base_qvel_limit: 0.5
   curriculum:

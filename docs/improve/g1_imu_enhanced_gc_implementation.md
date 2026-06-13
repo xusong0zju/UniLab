@@ -833,19 +833,39 @@ IMU 残余力 `f_residual = mass × (R @ accel_local - [0,0,9.81])` 的方向分
 
 **根因**：disturbance correction 无法区分"正常步行动力学"和"意外扰动"——阈值 5.0 N 太低，正常行走的 GRF 振荡（~245N）远超 5N。
 
-### 8.7 Disturbance 符号修正方案
+### 8.7 实际代码变更（2026-06-13）
 
-三种可选方案：
+**实际实施的方案**（commit `592a5dab`）：
 
-| 方案 | 修改 | 优点 | 缺点 |
-|------|------|------|------|
-| A. `-= τ_dist` | 仅改符号 | 正确抵消扰动 | 阻碍正常行走，收敛慢 |
-| B. `-= τ_dist` + 提高阈值至 50N | 改符号+阈值 | 仅大扰动时激活 | 阈值难调 |
-| C. `disturbance_scale = 0` | 禁用 disturbance | 最简单，只靠 gravity+swing | 丧失扰动修正能力 |
+最终采用了 **gravity_factor 方案**（非文档初版描述的 `-= τ_dist`）：
 
-**当前训练使用方案 A**（`-= τ_dist`, scale=0.2, threshold=5.0），iter 2630 reward=117.12，收敛明显慢于旧版（iter 1000=59.4）。方案 B 或 C 可能在训练效率上更好。
+```python
+# 旧公式
+τ = PD + g(q)·(mask + swing_boost·swing_mask) + 0.2·τ_disturbance
 
-### 8.8 §8.6 统一公式推导验证
+# 新公式（当前代码）
+τ = PD + gravity_scale·g(q)·gravity_factor·effective_mask
+# gravity_factor = clip(1 + a_net_z/9.81, 0, 2)  — IMU 实时调制
+```
+
+主要变更：
+- **删除** disturbance correction（`τ_disturbance`、`disturbance_scale`、Jacobian 计算全部移除）
+- **新增** `gravity_factor = clip(1 + a_net_z/9.81, 0, 2)`，per-env 乘到 g(q) 上
+- **新增** config `imu_modulated_gravity: bool`
+- IMU 仍用于 swing 检测（gait_phase + IMU 交叉验证，不受影响）
+
+### 8.8 gravity_factor 的物理问题
+
+**详细分析见** `docs/analy/imu_torque_feedforward_physics_analysis.md`。
+
+核心问题：行走时 `a_net_z` 以 ~3Hz 振荡于 ±2 m/s²，导致 `gravity_factor` 在 0.7~1.3 间振荡。这：
+- 把行走的**结果**（pelvis 加速度振荡）当成重力变化的**原因**喂回补偿
+- 形成错误的反馈回路，PD 被迫对抗 feedforward 振荡
+- 导致初期收敛极慢（iter 1000=3.75 vs 旧版 59.4）
+
+**当前状态（2026-06-13）**：`imu_modulated_gravity` 已设为 `false`，力矩退化为 `τ = PD + g(q)·(mask + swing_boost·swing_mask)`，IMU 仅用于 swing 检测。
+
+### 8.9 统一公式推导验证
 
 从 MuJoCo 动力学出发：
 
@@ -860,26 +880,20 @@ Mq̈ = τ_ctrl - qfrc_bias + qfrc_constraint
        = PD + g(q) - qfrc_constraint
 ```
 
-这验证了 **gravity 用 `+=`，contact 用 `-=`** 的正确性——与当前代码一致！
+这验证了 **gravity 用 `+=`，contact 用 `-=`** 的正确性——与当前代码一致。
 
-对于 IMU-GC disturbance（同 CTC(IMU) 源的 `tau_contact`）：
-- 理论上应为 `τ -= τ_dist`（减去以抵消约束力）
-- 但行走时 `τ_dist` 主要反映正常动力学而非扰动，`-=` 会过度抵消
-
-### 8.9 对之前实验结论的修正
+### 8.10 对之前实验结论的修正
 
 | 初版结论（已推翻） | 修正后结论 |
 |-----------------|----------|
 | GC `+=` 是 Bug | GC `+=` 是正确的重力补偿 |
 | GC reward 高是"负重训练"效应 | GC reward 高是 Stance 过补偿的有益效果 |
 | CTC(IMU) `-=` 削弱过补偿所以效果差 | CTC(IMU) `-=` 方向正确，减去 GRF 降低过补偿 |
-| 所有补偿项符号都要反 | 只有 disturbance `+=` 是 Bug |
-| 所有 A/B 对比需重跑 | A/B 对比结论基本正确，只需修正 disturbance |
+| 所有补偿项符号都要反 | 三控制器的 `+=` 符号正确，disturbance `+=` 有方向矛盾 |
+| 所有 A/B 对比需重跑 | A/B 对比结论基本正确 |
 
-### 8.10 修正总结
+### 8.11 修正总结
 
-**唯一修改**：`imu_gc_controller.py` 中 disturbance correction 从 `+=` 改为 `-=`。
+**三个控制器（GravityComp / CoriolisComp / ContactComp）不需要修改**——它们的 `+= g(q)` / `+= C(q,q̇)q̇` / `-= τ_contact` 符号都是正确的。
 
-**其他三个控制器（GravityComp / CoriolisComp / ContactComp）不需要修改**——它们的 `+= g(q)` / `+= C(q,q̇)q̇` / `-= τ_contact` 符号都是正确的。
-
-**当前训练**：IMU-GC 96×2, 10000 iters, disturbance `-=`, scale=0.2, threshold=5.0
+**IMU-GC 当前配置**：`imu_modulated_gravity=false`，力矩公式 `τ = PD + g(q)·(mask + 0.3·swing_mask)`。

@@ -3060,9 +3060,15 @@ class G1WalkFlatIMUGCEvn(G1BaseEnv):
         """Pre-step callback: IMU-enhanced gravity compensation.
 
         τ = PD + gravity_scale·g(q)·modulated_mask
+
         where modulated_mask:
-        - Leg joints [0:12]: mask + swing_boost·swing_mask
-        - Upper body joints [12:]: mask · imu_gravity_factor
+        - Leg joints [0:12]: mask + swing_boost·swing_mask (swing detected via gait_phase + IMU)
+        - Upper body joints [12:]: mask (waist gets GC, arms excluded)
+
+        IMU is used ONLY for swing-leg detection (cross-validating gait_phase).
+        The imu_modulated_gravity feature (gravity_factor based on a_net_z) is disabled
+        by default; see docs/analy/imu_torque_feedforward_physics_analysis.md for the
+        physics analysis of why per-step gravity modulation is incorrect.
         """
         self._dynamics_model.invalidate_cache()
 
