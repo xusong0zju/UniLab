@@ -272,9 +272,30 @@ tau_imu = A_actuated.T @ F_dist.T  # (nv_act, N) = (3×nv_act)^T × (3×N)
 - PID：15998（运行中）
 - iter ~7530 reward=321.2
 
-### 4.2 旧版（gravity_factor=false, disturbance removed）
+### 4.2 新版（gravity_factor=false, disturbance removed）
 
-待启动。
+> **状态**：已完成（2026-06-14）。日志：`logs/flash_sac/G1WalkFlatIMUGC/2026-06-13_23-57-39_mujoco/`
+
+**A/B 对比结果**：
+
+| iter | gf=true | gf=false | Δ |
+|------|---------|----------|---|
+| 500 | 5.75 | 5.26 | -0.49 |
+| 1000 | 9.35 | 10.92 | +1.58 |
+| 2000 | 75.23 | 72.47 | -2.75 |
+| 3000 | 234.47 | 232.54 | -1.93 |
+| 5000 | 310.49 | 319.01 | +8.52 |
+| 10000 | 323.76 | 327.71 | +3.95 |
+
+| 指标 | gf=true | gf=false |
+|------|---------|----------|
+| best_mean_reward | 323.56 | 325.68 |
+| 训练时间 | 3225s | 3254s |
+
+**确认**：
+1. gravity_factor 对收敛无负面影响（iter 0-3000 曲线重合）→ §1.4 物理分析中"PD 被迫对抗振荡"的预测被证实为**影响极小**，PD 可以轻松克服 ~3Hz 振荡
+2. 晚期新版微弱领先 ~2-8 点 → 省略 per-step gravity_factor 计算减少了力矩注入中的高频噪声
+3. 之前 iter 1000=3.75 的慢速来自 **τ_disturbance 的删除**，而非 gravity_factor
 
 ---
 

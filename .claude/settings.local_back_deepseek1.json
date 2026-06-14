@@ -1,0 +1,37 @@
+{
+  "env": {
+        "ANTHROPIC_AUTH_TOKEN": "c1b2ae52-e551-4400-9eac-1f6b325fb86d",
+        "ANTHROPIC_BASE_URL": "https://kspmas.ksyun.com/v1/chat/completions",
+        "ANTHROPIC_MODEL": "deepseek-v4-pro",
+        "ANTHROPIC_CONTEXT_WINDOW": "1000000",
+        "MAX_TOKENS": "1000000"
+  },
+  "permissions": {
+
+    "allow": [
+      "Bash(git remote *)",
+      "Bash(gh auth *)",
+      "Bash(ls ~/.ssh/id_ed25519.pub 2>/dev/null && echo \"EXISTS\" || echo \"NOT_FOUND\")",
+      "Read(//root/.ssh/**)",
+      "Bash(ssh-keygen -t ed25519 -C \"xusong\" -f ~/.ssh/id_ed25519 -N \"\")",
+      "Bash(ssh -T git@github.com)",
+      "Bash(git push *)",
+      "Bash(pip show *)",
+      "Bash(grep -n \"^## 7\\\\. 验证\\\\|^## 6\\\\. 补偿选择\\\\|^---$\" /root/UniLab_WS/UniLab/docs/analy/pinocchio_compensation_plan.md)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)",
+      "Bash(uv run *)",
+      "Bash(awk '{print $2, $11, $12, $13, $14}')",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"from tbparse import SummaryReader; print\\('tbparse ok'\\)\")",
+      "Bash(python3 -c \"from tbparse import SummaryReader; print\\('ok'\\)\")",
+      "Bash(uv pip *)",
+      "Bash(awk '{print $2}')",
+      "Bash(kill 5898)",
+      "Bash(echo \"Baseline PID: $!\")",
+      "Bash(echo \"GC PID: $!\")",
+      "Bash(echo \"CC PID: $!\")",
+      "Bash(kill 5894 5897)",
+      "Bash(nvidia-smi)"
+    ]
+  }
+}

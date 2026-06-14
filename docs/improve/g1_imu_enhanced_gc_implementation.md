@@ -897,3 +897,40 @@ Mq̈ = τ_ctrl - qfrc_bias + qfrc_constraint
 **三个控制器（GravityComp / CoriolisComp / ContactComp）不需要修改**——它们的 `+= g(q)` / `+= C(q,q̇)q̇` / `-= τ_contact` 符号都是正确的。
 
 **IMU-GC 当前配置**：`imu_modulated_gravity=false`，力矩公式 `τ = PD + g(q)·(mask + 0.3·swing_mask)`。
+
+### 8.12 gravity_factor A/B 对比实验（2026-06-14）
+
+为验证禁用 `gravity_factor` 是否影响收敛，进行严格的 A/B 对比训练：
+
+| 条件 | 旧版 (gf=true) | 新版 (gf=false) |
+|------|--------------|----------------|
+| 公式 | `τ=PD+g(q)·(1+a_z/g)·(mask+swing)` | `τ=PD+g(q)·(mask+swing)` |
+| 日志 | `2026-06-13_22-45-06_mujoco/` | `2026-06-13_23-57-39_mujoco/` |
+| 其他参数 | s96, 4096 env, 10000 iter | **完全相同** |
+
+**结果**：
+
+| iter | 旧版 (gf=true) | 新版 (gf=false) | Δ |
+|------|--------------|----------------|---|
+| 500 | 5.75 | 5.26 | -0.49 |
+| 1000 | 9.35 | 10.92 | +1.58 |
+| 1500 | 24.66 | 29.36 | +4.70 |
+| 2000 | 75.23 | 72.47 | -2.75 |
+| 2500 | 200.21 | 190.11 | -10.10 |
+| 3000 | 234.47 | 232.54 | -1.93 |
+| 5000 | 310.49 | **319.01** | **+8.52** |
+| 10000 | 323.76 | **327.71** | **+3.95** |
+
+| 指标 | 旧版 (gf=true) | 新版 (gf=false) | Δ |
+|------|--------------|----------------|---|
+| best_mean_reward | 323.56 | 325.68 | +2.12 |
+| 训练时间 | 3225s | 3254s | +29s |
+
+**结论**：
+
+1. **gravity_factor 对初期收敛无负面影响**：iter 0-3000 两条曲线几乎重合，PD 控制器可轻松克服 ~3Hz 的 gravity_factor 振荡
+2. **晚期新版微弱领先**：iter 5000+ 新版领先 ~2-8 点（<3%），可能是因为省略了 per-step 的 `clip(1+a_z/g)` 计算，减少了力矩注入中的高频噪声
+3. **之前 iter 1000=3.75 的慢速来源于 τ_disturbance 的删除**：`gravity_factor=true` 和 `false` 两版在 iter 1000 均只有 ~9.4 的 reward；但旧版 IMU-GC（含 disturbance）在同一 iter 可达 59.4。真正的加速因子是 disturbance correction，而非 gravity_factor
+4. **可以安全禁用 gravity_factor**：让 IMU 专注于 swing 检测（其本来的设计意图），避免不必要的 per-step 重力调制
+
+物理分析见 `docs/analy/imu_torque_feedforward_physics_analysis.md`。
