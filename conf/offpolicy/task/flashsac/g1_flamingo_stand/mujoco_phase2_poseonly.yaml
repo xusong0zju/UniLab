@@ -1,0 +1,65 @@
+# @package _global_
+# Phase 2 V5: Pose-only training — force leg lift by making it the ONLY objective.
+# All other rewards at zero. Start from Phase 1 checkpoint.
+#
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_flamingo_stand/mujoco_phase2_poseonly \
+#     algo=flashsac algo.load_run=<phase1_best>
+
+training:
+  task_name: G1FlamingoStand
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 49
+  max_iterations: 3000
+  save_interval: 500
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+
+env:
+  control_config:
+    action_scale: 1.0
+  reset_base_qvel_limit: 0.05
+  curriculum:
+    enabled: false                  # disable curriculum — pure pose tracking
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.005
+    scale_joint_vel: 0.05
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: false
+    randomize_base_mass: false
+    randomize_body_mass: false
+    random_com: false
+    randomize_ground_friction: false
+    randomize_kp: false
+    randomize_kd: false
+    randomize_gravity: false
+
+reward:
+  scales:
+    # Only these matter
+    pose: -10.0                    # EXTREME: must track target pose
+    penalty_lifted_foot_contact: -50.0  # foot must be >5cm above ground
+    penalty_support_foot_contact: 0.0  # disabled
+    penalty_feet_ori: -25.0        # keep feet flat
+    # Minimal survival
+    penalty_orientation: -5.0      # mild upright
+    penalty_base_height: -100.0    # keep height
+    penalty_ang_vel_xy: -1.0       # mild damping
+    com_over_support: 0.0
+    penalty_action_rate: -5.0
+    alive: 1.0                     # minimal
+    penalty_close_feet_xy: 0.0
+  base_height_target: 0.754
+  min_base_height: 0.35
+  max_tilt_deg: 60.0
+  close_feet_threshold: 0.15
+  # R1: gentle lift
+  target_pose_offsets: [-0.3,0,0,0.4,0,0, 0,0,0,0,0,0, 0,0,0, 0,0,0,0,0,0,0, 0,0,0,0,0,0,0]

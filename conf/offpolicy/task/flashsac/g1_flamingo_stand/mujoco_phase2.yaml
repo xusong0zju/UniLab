@@ -1,0 +1,72 @@
+# @package _global_
+# G1 Flamingo Stand V6: starts from "flamingo" keyframe (left leg pre-lifted).
+# No Phase 1 needed — keyframe IS the target. Policy only maintains balance.
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_flamingo_stand/mujoco_phase2 algo=flashsac
+
+training:
+  task_name: G1FlamingoStand
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 49
+  max_iterations: 5000
+  save_interval: 500
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+
+env:
+  control_config:
+    action_scale: 1.0
+  reset_base_qvel_limit: 0.05
+  curriculum:
+    enabled: true
+    initial_scale: 0.5
+    min_scale: 0.5
+    max_scale: 1.0
+    level_down_threshold: 150.0
+    level_up_threshold: 750.0
+    degree: 0.001
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.005
+    scale_joint_vel: 0.05
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: false
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    penalty_orientation: -20.0
+    penalty_base_height: -200.0
+    penalty_ang_vel_xy: -2.0
+    pose: -1.0
+    penalty_support_foot_contact: -15.0
+    penalty_lifted_foot_contact: -30.0
+    com_over_support: 2.0
+    penalty_action_rate: -5.0
+    alive: 5.0
+    penalty_feet_ori: -25.0
+    penalty_close_feet_xy: -10.0
+  base_height_target: 0.754
+  min_base_height: 0.35
+  max_tilt_deg: 60.0
+  close_feet_threshold: 0.15
