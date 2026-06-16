@@ -1,0 +1,122 @@
+# @package _global_
+# Phase C3 Mamba: 200N push, all modes.
+# Larger network for multi-modal behavior: actor 256, critic 512, 3 blocks
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mujoco algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 49
+  max_iterations: 10000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 256       # up from 128
+  critic_hidden_dim: 512       # up from 256
+  algo_params:
+    actor_num_blocks: 3        # up from 2
+    critic_num_blocks: 3       # up from 2
+    normalize_reward: true
+    normalized_g_max: 5.0
+    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_max: 16
+    critic_min_v: -5.0
+    critic_max_v: 5.0
+    temp_initial_value: 0.01
+    temp_target_sigma: 0.15
+    n_step: 1
+    amp_dtype: auto
+    use_compile: true
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
+
+env:
+  control_config:
+    action_scale: 1.0
+  gait_phase_init_mode: "offset_phase"
+  reset_base_qvel_limit: 0.5
+  commands:
+    vel_limit: [[0.3, -0.2, -0.5], [1.2, 0.2, 0.5]]  # big stride: vx 0.3-1.2 m/s
+    resampling_time: 0.0
+    rel_standing_envs: 0.25
+    rel_flamingo_envs: 0.15      # 15% flamingo, 10% stand, 75% walk
+  curriculum:
+    enabled: true
+    initial_scale: 0.5
+    min_scale: 0.5
+    max_scale: 1.0
+    level_down_threshold: 150.0
+    level_up_threshold: 750.0
+    degree: 0.001
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 0.1
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: true
+    max_force: [200, 200, 100]
+    multi_body_push:
+      push_body_names:
+        - pelvis
+        - torso_link
+        - left_shoulder_pitch_link
+        - right_shoulder_pitch_link
+        - left_elbow_link
+        - right_elbow_link
+        - left_hip_pitch_link
+        - right_hip_pitch_link
+        - left_knee_link
+        - right_knee_link
+        - left_ankle_pitch_link
+        - right_ankle_pitch_link
+        - right_shoulder_pitch_link
+      push_duration_steps: 50
+      push_interval: 150
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    tracking_lin_vel: 2.0
+    tracking_ang_vel: 1.5
+    penalty_ang_vel_xy: -1.0
+    penalty_orientation: -10.0
+    penalty_action_rate: -5.0
+    pose: -0.5
+    penalty_feet_ori: -25.0
+    feet_phase: 5.0
+    alive: 10.0
+    # Flamingo rewards (registered in G1MultiSkillEnv code)
+    penalty_lifted_foot_contact: -30.0
+    penalty_support_foot_contact: -15.0
+    com_over_support: 2.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.3
+  max_tilt_deg: 65.0
+  gait_frequency: 1.2                # slower cadence = bigger strides
+  feet_phase_swing_height: 0.12      # higher foot lift
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]

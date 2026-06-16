@@ -274,7 +274,9 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
                 chosen = np.random.choice(body_ids)
                 force = env._backend._sample_push_force(domain_rand.max_force)
                 self._active_pushes[chosen] = force.copy()
-                self._push_remaining[chosen] = np.full(num_envs, duration)
+                # Random duration 0.5~2.0s (25~100 steps at 50Hz) per env
+                dur = np.random.randint(25, 101, size=(num_envs,))
+                self._push_remaining[chosen] = dur
 
         # Decrement all active pushes
         expired = []
