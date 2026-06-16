@@ -59,6 +59,20 @@ def build_actor(
             device=device,
         )
     if algo_type == "flashsac":
+        if kwargs.get("use_mamba_actor"):
+            from unilab.algos.torch.flash_sac.mamba_actor import MambaActor
+
+            return MambaActor(
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                d_model=actor_hidden_dim,
+                n_layers=actor_num_blocks,
+                d_state=kwargs.get("mamba_d_state", 16),
+                n_tokens=kwargs.get("mamba_n_tokens", 4),
+                noise_zeta_mu=actor_noise_zeta_mu,
+                noise_zeta_max=actor_noise_zeta_max,
+                device=device,
+            )
         from unilab.algos.torch.flash_sac.network import FlashSACActor
 
         return FlashSACActor(

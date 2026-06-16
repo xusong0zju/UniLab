@@ -147,6 +147,9 @@ class FlashSACLearner:
         critic_hidden_dim: int = 256,
         actor_num_blocks: int = 2,
         critic_num_blocks: int = 2,
+        use_mamba_actor: bool = False,
+        mamba_d_state: int = 16,
+        mamba_n_tokens: int = 4,
         num_atoms: int = 101,
         critic_min_v: float = -5.0,
         critic_max_v: float = 5.0,
@@ -185,15 +188,28 @@ class FlashSACLearner:
             use_compile and hasattr(torch, "compile") and self.device.type == "cuda"
         )
 
-        self.actor = FlashSACActor(
-            num_blocks=actor_num_blocks,
-            input_dim=obs_dim,
-            hidden_dim=actor_hidden_dim,
-            action_dim=action_dim,
-            noise_zeta_mu=actor_noise_zeta_mu,
-            noise_zeta_max=actor_noise_zeta_max,
-            device=self.device,
-        )
+        if use_mamba_actor:
+            from unilab.algos.torch.flash_sac.mamba_actor import MambaActor
+
+            self.actor = MambaActor(
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                d_model=actor_hidden_dim,
+                n_layers=actor_num_blocks,
+                d_state=mamba_d_state,
+                n_tokens=mamba_n_tokens,
+                device=self.device,
+            )
+        else:
+            self.actor = FlashSACActor(
+                num_blocks=actor_num_blocks,
+                input_dim=obs_dim,
+                hidden_dim=actor_hidden_dim,
+                action_dim=action_dim,
+                noise_zeta_mu=actor_noise_zeta_mu,
+                noise_zeta_max=actor_noise_zeta_max,
+                device=self.device,
+            )
         self.critic = FlashSACDoubleCritic(
             num_blocks=critic_num_blocks,
             input_dim=self.critic_obs_dim + action_dim,

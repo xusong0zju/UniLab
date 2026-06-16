@@ -185,7 +185,10 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
     def build_reset_plan(self, env, env_ids):
         """Build reset plan with per-env keyframe selection (stand vs flamingo)."""
         num_reset = len(env_ids)
-        is_flamingo = getattr(env, "_is_flamingo", np.zeros(env.num_envs, dtype=bool))[env_ids]
+        flamingo_arr = getattr(env, "_is_flamingo", None)
+        if flamingo_arr is None or len(flamingo_arr) != env.num_envs:
+            flamingo_arr = np.zeros(env.num_envs, dtype=bool)
+        is_flamingo = flamingo_arr[env_ids]
 
         # Start from stand keyframe by default
         qpos_all = np.tile(self._stand_qpos, (num_reset, 1))
@@ -359,6 +362,10 @@ class G1MultiSkillEnv(G1WalkEnv):
             )
 
         self._init_reward_functions()
+        # Add flamingo-specific rewards (not in G1WalkRewardConfig)
+        self._reward_fns["penalty_lifted_foot_contact"] = self._reward_lifted_foot_contact
+        self._reward_fns["penalty_support_foot_contact"] = self._reward_support_foot_contact
+        self._reward_fns["com_over_support"] = self._reward_com_over_support
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
@@ -388,11 +395,26 @@ class G1MultiSkillEnv(G1WalkEnv):
             flamingo_qpos=flamingo_qpos,
             flamingo_ctrl=flamingo_ctrl,
         )
-        # Flamingo flag storage for reset
-        self._is_flamingo: np.ndarray = np.zeros(num_envs, dtype=bool)
+        # Flamingo flag storage for reset (resized dynamically)
+        self._is_flamingo: np.ndarray = np.zeros(0, dtype=bool)
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
+
+    # ── Flamingo-specific reward functions ───────────────────────────
+    def _reward_lifted_foot_contact(self, ctx):
+        left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        return np.asarray(left_contact, dtype=get_global_dtype())
+
+    def _reward_support_foot_contact(self, ctx):
+        right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        return np.asarray(~right_contact, dtype=get_global_dtype())
+
+    def _reward_com_over_support(self, ctx):
+        com = np.asarray(self._backend.get_base_pos(), dtype=get_global_dtype())
+        rf = np.asarray(self._backend.get_sensor_data("right_foot_pos"), dtype=get_global_dtype())
+        d = np.linalg.norm(com[:, :2] - rf[:, :2], axis=1)
+        return np.asarray(np.exp(-(d**2) / 0.02), dtype=get_global_dtype())
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:

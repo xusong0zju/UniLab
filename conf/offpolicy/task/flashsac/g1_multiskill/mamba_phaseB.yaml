@@ -1,5 +1,5 @@
 # @package _global_
-# G1 Multi-Skill: walk (big stride) + stand + flamingo + multi-body persistent push
+# Phase B Mamba: +Flamingo (15%). Warm-start from Phase A.
 # Larger network for multi-modal behavior: actor 256, critic 512, 3 blocks
 # Usage:
 #   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mujoco algo=flashsac
@@ -11,7 +11,7 @@ training:
 algo:
   num_envs: 4096
   learning_starts: 49
-  max_iterations: 10000
+  max_iterations: 2000
   save_interval: 1000
   updates_per_step: 8
   replay_buffer_n: 256
@@ -32,6 +32,9 @@ algo:
     n_step: 1
     amp_dtype: auto
     use_compile: true
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
 
 env:
   control_config:
@@ -59,7 +62,7 @@ env:
     scale_joint_vel: 0.1
     scale_linvel: 0.0
   domain_rand:
-    push_robots: true
+    push_robots: false
     max_force: [800, 800, 400]
     multi_body_push:
       push_body_names:

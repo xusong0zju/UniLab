@@ -1,5 +1,5 @@
 # @package _global_
-# G1 Multi-Skill: walk (big stride) + stand + flamingo + multi-body persistent push
+# Phase A: Walk + Stand only. No flamingo, no push.
 # Larger network for multi-modal behavior: actor 256, critic 512, 3 blocks
 # Usage:
 #   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mujoco algo=flashsac
@@ -11,7 +11,7 @@ training:
 algo:
   num_envs: 4096
   learning_starts: 49
-  max_iterations: 10000
+  max_iterations: 3000
   save_interval: 1000
   updates_per_step: 8
   replay_buffer_n: 256
@@ -42,7 +42,7 @@ env:
     vel_limit: [[0.3, -0.2, -0.5], [1.2, 0.2, 0.5]]  # big stride: vx 0.3-1.2 m/s
     resampling_time: 0.0
     rel_standing_envs: 0.25
-    rel_flamingo_envs: 0.15      # 15% flamingo, 10% stand, 75% walk
+    rel_flamingo_envs: 0.0      # 15% flamingo, 10% stand, 75% walk
   curriculum:
     enabled: true
     initial_scale: 0.5
@@ -59,7 +59,7 @@ env:
     scale_joint_vel: 0.1
     scale_linvel: 0.0
   domain_rand:
-    push_robots: true
+    push_robots: false
     max_force: [800, 800, 400]
     multi_body_push:
       push_body_names:
@@ -104,9 +104,9 @@ reward:
     feet_phase: 5.0
     alive: 10.0
     # Flamingo rewards (registered in G1MultiSkillEnv code)
-    penalty_lifted_foot_contact: -30.0
-    penalty_support_foot_contact: -15.0
-    com_over_support: 2.0
+    penalty_lifted_foot_contact: 0.0
+    penalty_support_foot_contact: 0.0
+    com_over_support: 0.0
   tracking_sigma: 0.25
   base_height_target: 0.754
   min_base_height: 0.3
