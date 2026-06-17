@@ -197,7 +197,7 @@ class MambaActor(nn.Module):
         self.d_model = d_model
         self.n_tokens = n_tokens
 
-        # Token embedding: split 98-dim obs into n_tokens tokens
+        # Token embedding: split obs into n_tokens tokens
         self.token_proj = nn.Linear(obs_dim, d_model * n_tokens)
         # Position encoding (learnable)
         self.pos_emb = nn.Parameter(torch.randn(1, n_tokens, d_model) * 0.02)
@@ -244,16 +244,13 @@ class MambaActor(nn.Module):
     def _encode(self, obs: torch.Tensor, training: bool) -> torch.Tensor:
         """Encode observation through Mamba backbone."""
         B = obs.shape[0]
-        # Tokenize
         x = self.token_proj(obs)  # (B, d_model * n_tokens)
         x = x.reshape(B, self.n_tokens, self.d_model)  # (B, L, d_model)
-        x = x + self.pos_emb  # add position encoding
+        x = x + self.pos_emb
 
-        # Mamba blocks
         for block in self.blocks:
             x = block(x)
 
-        # Pool over tokens
         x = x.mean(dim=1)  # (B, d_model)
         x = self.post_norm(x)
         return x

@@ -90,6 +90,7 @@ class MultiSkillCommands(Commands):
     """Commands with flamingo mode support."""
 
     rel_flamingo_envs: float = 0.0  # fraction of envs in flamingo (single-leg) mode
+    rel_fallen_envs: float = 0.0    # fraction of envs starting from fallen postures
 
 
 @registry.envcfg("G1MultiSkill")
@@ -160,23 +161,21 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
             standing = np.random.uniform(size=(num_reset,)) < min(standing_prob, 1.0)
             commands[standing] = 0.0
 
-        # Flamingo envs
+        # Flamingo envs (subset of standing)
         flamingo_prob = float(getattr(env.cfg.commands, "rel_flamingo_envs", 0.0))
-        is_flamingo = np.zeros(num_reset, dtype=bool)
-        if flamingo_prob > 0.0:
-            # Flamingo envs are a SUBSET of standing envs (zero commands)
-            available = np.ones(num_reset, dtype=bool)
-            if standing_prob > 0.0:
-                available = standing.copy()
-            num_flamingo = int(flamingo_prob * num_reset)
-            if num_flamingo > 0:
-                available_idx = np.where(available)[0]
-                chosen = np.random.choice(available_idx, size=min(num_flamingo, len(available_idx)), replace=False)
-                is_flamingo[chosen] = True
-                commands[chosen] = 0.0
+        is_flamingo = np.random.uniform(size=(num_reset,)) < flamingo_prob if flamingo_prob > 0 else np.zeros(num_reset, dtype=bool)
+        if np.any(is_flamingo):
+            commands[is_flamingo] = 0.0
 
         # Store flamingo flag in env for keyframe selection during build_reset_plan
         env._is_flamingo = is_flamingo
+
+        # Fallen envs — start from a fallen posture (Phase D: fall recovery)
+        fallen_prob = float(getattr(env.cfg.commands, "rel_fallen_envs", 0.0))
+        is_fallen = np.random.uniform(size=(num_reset,)) < fallen_prob if fallen_prob > 0 else np.zeros(num_reset, dtype=bool)
+        if np.any(is_fallen):
+            commands[is_fallen] = 0.0  # stay in place while getting up
+        env._is_fallen = is_fallen
 
         if getattr(env.cfg.commands, "heading_command", False):
             commands[:, 2] = 0.0
@@ -195,6 +194,35 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         # Override flamingo envs with flamingo keyframe
         if np.any(is_flamingo):
             qpos_all[is_flamingo] = self._flamingo_qpos
+
+        # ---- Fallen postures (Phase D) ----
+        fallen_arr = getattr(env, "_is_fallen", None)
+        if fallen_arr is None or len(fallen_arr) != env.num_envs:
+            fallen_arr = np.zeros(env.num_envs, dtype=bool)
+        is_fallen = fallen_arr[env_ids]
+        if np.any(is_fallen):
+            n_fallen = int(np.sum(is_fallen))
+            # Random fallen posture per env: 0=supine, 1=prone, 2=side
+            fallen_type = np.random.randint(0, 3, size=(n_fallen,))
+            # Base lowered to just above termination (0.35m)
+            fallen_qpos = np.tile(self._stand_qpos, (n_fallen, 1))
+            fallen_qpos[:, 2] = 0.35  # base z near ground
+            # Tilt quaternion based on type
+            for i, ft in enumerate(fallen_type):
+                if ft == 0:  # supine: roll back ~80deg
+                    half_angle = np.deg2rad(80) / 2
+                    q = np.array([np.cos(half_angle), np.sin(half_angle), 0, 0])
+                elif ft == 1:  # prone: pitch forward ~-70deg
+                    half_angle = np.deg2rad(-70) / 2
+                    q = np.array([np.cos(half_angle), 0, np.sin(half_angle), 0])
+                else:  # side: roll 45 + pitch 30
+                    q_roll = np.array([np.cos(np.deg2rad(45)/2), np.sin(np.deg2rad(45)/2), 0, 0])
+                    q_pitch = np.array([np.cos(np.deg2rad(30)/2), 0, np.sin(np.deg2rad(30)/2), 0])
+                    q = np_quat_mul(q_roll.reshape(1,4), q_pitch.reshape(1,4))[0]
+                fallen_qpos[i, 3:7] = np_quat_mul(
+                    fallen_qpos[i, 3:7].reshape(1,4), q.reshape(1,4)
+                )[0]
+            qpos_all[is_fallen] = fallen_qpos
 
         qvel = np.tile(env._init_qvel, (num_reset, 1))
         qpos_all[:, 0:2] += np.random.uniform(-0.5, 0.5, (num_reset, 2))
@@ -368,6 +396,8 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["penalty_lifted_foot_contact"] = self._reward_lifted_foot_contact
         self._reward_fns["penalty_support_foot_contact"] = self._reward_support_foot_contact
         self._reward_fns["com_over_support"] = self._reward_com_over_support
+        # Height-adaptive orientation: reduced penalty near ground (HoST-inspired get-up guidance)
+        self._reward_fns["penalty_orientation_adaptive"] = self._reward_orientation_adaptive
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
@@ -399,6 +429,7 @@ class G1MultiSkillEnv(G1WalkEnv):
         )
         # Flamingo flag storage for reset (resized dynamically)
         self._is_flamingo: np.ndarray = np.zeros(0, dtype=bool)
+        self._is_fallen: np.ndarray = np.zeros(0, dtype=bool)
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
@@ -417,6 +448,21 @@ class G1MultiSkillEnv(G1WalkEnv):
         rf = np.asarray(self._backend.get_sensor_data("right_foot_pos"), dtype=get_global_dtype())
         d = np.linalg.norm(com[:, :2] - rf[:, :2], axis=1)
         return np.asarray(np.exp(-(d**2) / 0.02), dtype=get_global_dtype())
+
+    def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
+        """Orientation penalty scaled by height — gentle when near ground (getting up).
+
+        HoST-inspired: reduces tilt penalty when robot is low, letting it explore
+        getting-up motions without being crushed by orientation error.
+        Above 0.55m: full penalty. Below: linear ramp from 10% to 100%.
+        """
+        g = ctx.gravity
+        assert g is not None
+        orientation_error = np.square(g[:, 0]) + np.square(g[:, 1])
+        base_z = self._backend.get_base_pos()[:, 2]
+        # Height gate: 0.35m→0.1, 0.55m→1.0
+        height_scale = np.clip((base_z - 0.35) / 0.20, 0.1, 1.0)
+        return np.asarray(orientation_error * height_scale, dtype=get_global_dtype())
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:
@@ -447,6 +493,16 @@ class G1MultiSkillEnv(G1WalkEnv):
         self.step_counter += 1
         t = self._compute_truncated(self._state)
         np.logical_or(self._state.truncated, t, out=self._state.truncated)
+
+        # ── Command resampling for mode transitions mid-episode ──
+        resample_s = float(getattr(self._cfg.commands, "resampling_time", 0.0))
+        if resample_s > 0:
+            resample_interval = int(resample_s / self._cfg.ctrl_dt)
+            if resample_interval > 0 and self.step_counter % resample_interval == 0 and self.step_counter > 0:
+                # Resample velocity commands for all envs
+                new_cmds = self._dr_manager._provider._sample_commands(self, self._num_envs)
+                self._state.info["commands"] = new_cmds
+
         if self._autoreset and np.any(self._state.terminated | self._state.truncated):
             self._reset_done_envs()
         np.nan_to_num(self._state.reward, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
