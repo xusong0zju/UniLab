@@ -210,14 +210,11 @@ class FlashSACLearner:
                 noise_zeta_max=actor_noise_zeta_max,
                 device=self.device,
             )
+        # MLP Critic only — MambaCritic SSM backward pass freezes
         self.critic = FlashSACDoubleCritic(
-            num_blocks=critic_num_blocks,
-            input_dim=self.critic_obs_dim + action_dim,
-            hidden_dim=critic_hidden_dim,
-            num_bins=num_atoms,
-            min_v=critic_min_v,
-            max_v=critic_max_v,
-            device=self.device,
+            num_blocks=critic_num_blocks, input_dim=self.critic_obs_dim + action_dim,
+            hidden_dim=critic_hidden_dim, num_bins=num_atoms,
+            min_v=critic_min_v, max_v=critic_max_v, device=self.device,
         )
         self.target_critic = copy.deepcopy(self.critic).to(self.device)
         self.target_critic.eval()

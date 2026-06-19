@@ -130,6 +130,8 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         stand_ctrl=None,
         flamingo_qpos=None,
         flamingo_ctrl=None,
+        kneeling_qpos=None,
+        kneeling_ctrl=None,
     ):
         super().__init__(base_kp=base_kp, base_kd=base_kd)
         self._base_body_mass = base_body_mass
@@ -140,6 +142,8 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         self._stand_ctrl = stand_ctrl
         self._flamingo_qpos = flamingo_qpos
         self._flamingo_ctrl = flamingo_ctrl
+        self._kneeling_qpos = kneeling_qpos
+        self._kneeling_ctrl = kneeling_ctrl
         # Persistent push state: (num_envs, push_duration_steps, 3) per body
         self._active_pushes: dict[int, np.ndarray] = {}  # body_id -> (num_envs, 3) force
         self._push_remaining: dict[int, np.ndarray] = {}  # body_id -> (num_envs,) steps left
@@ -195,15 +199,30 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         if np.any(is_flamingo):
             qpos_all[is_flamingo] = self._flamingo_qpos
 
-        # ---- Fallen postures (Phase D) ----
+        # ---- Fallen postures (Phase D/G) with kneeling curriculum ----
         fallen_arr = getattr(env, "_is_fallen", None)
         if fallen_arr is None or len(fallen_arr) != env.num_envs:
             fallen_arr = np.zeros(env.num_envs, dtype=bool)
         is_fallen = fallen_arr[env_ids]
         if np.any(is_fallen):
             n_fallen = int(np.sum(is_fallen))
+            # Half kneeling (easier), half full-fallen (harder)
+            if self._kneeling_qpos is not None:
+                half = n_fallen // 2
+                kneeling_idx = np.zeros(n_fallen, dtype=bool)
+                kneeling_idx[:half] = True
+                np.random.shuffle(kneeling_idx)
+                # Kneeling posture
+                kneel_qpos = np.tile(self._kneeling_qpos, (np.sum(kneeling_idx), 1))
+                qpos_all[is_fallen] = np.where(kneeling_idx[:, None], kneel_qpos, qpos_all[is_fallen])
+                # Full fallen for the rest
+                n_fallen = n_fallen - half
+                is_fallen[is_fallen] = ~kneeling_idx  # only the non-kneeling ones stay as fallen
+                # Re-count after split
+                if n_fallen == 0:
+                    is_fallen[:] = False
             # Random fallen posture per env: 0=supine, 1=prone, 2=side
-            fallen_type = np.random.randint(0, 3, size=(n_fallen,))
+            fallen_type = np.random.randint(0, 3, size=(int(np.sum(is_fallen)),))
             # Base lowered to just above termination (0.35m)
             fallen_qpos = np.tile(self._stand_qpos, (n_fallen, 1))
             fallen_qpos[:, 2] = 0.35  # base z near ground
@@ -398,12 +417,20 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["com_over_support"] = self._reward_com_over_support
         # Height-adaptive orientation: reduced penalty near ground (HoST-inspired get-up guidance)
         self._reward_fns["penalty_orientation_adaptive"] = self._reward_orientation_adaptive
+        # HumanUP-inspired get-up rewards (Phase G v2)
+        self._reward_fns["height_exp"] = self._reward_height_exp
+        self._reward_fns["delta_height"] = self._reward_delta_height
+        self._reward_fns["stand_feet"] = self._reward_stand_feet
+        self._reward_fns["soft_symmetry"] = self._reward_soft_symmetry
+        self._reward_fns["uprightness_exp"] = self._reward_uprightness_exp
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
         stand_ctrl = stand_qpos[-self._num_action:].copy() if len(stand_qpos) > self._num_action else None
         flamingo_qpos = backend.get_keyframe_qpos("flamingo")
         flamingo_ctrl = flamingo_qpos[-self._num_action:].copy() if len(flamingo_qpos) > self._num_action else None
+        kneeling_qpos = backend.get_keyframe_qpos("kneeling")
+        kneeling_ctrl = kneeling_qpos[-self._num_action:].copy() if len(kneeling_qpos) > self._num_action else None
 
         base_kp, base_kd = None, None
         if cfg.domain_rand.randomize_kp or cfg.domain_rand.randomize_kd:
@@ -426,6 +453,8 @@ class G1MultiSkillEnv(G1WalkEnv):
             stand_ctrl=stand_ctrl,
             flamingo_qpos=flamingo_qpos,
             flamingo_ctrl=flamingo_ctrl,
+            kneeling_qpos=kneeling_qpos,
+            kneeling_ctrl=kneeling_ctrl,
         )
         # Flamingo flag storage for reset (resized dynamically)
         self._is_flamingo: np.ndarray = np.zeros(0, dtype=bool)
@@ -449,6 +478,46 @@ class G1MultiSkillEnv(G1WalkEnv):
         d = np.linalg.norm(com[:, :2] - rf[:, :2], axis=1)
         return np.asarray(np.exp(-(d**2) / 0.02), dtype=get_global_dtype())
 
+    # ── HumanUP-inspired GetUp rewards ──────────────────────────────
+
+    def _reward_height_exp(self, ctx: RewardContext) -> np.ndarray:
+        """Exponential height reward: exp(h_base) - 1. Every cm counts."""
+        h = self._backend.get_base_pos()[:, 2]
+        return np.asarray(np.exp(np.clip(h, 0.05, 0.8)) - 1.0, dtype=get_global_dtype())
+
+    def _reward_delta_height(self, ctx: RewardContext) -> np.ndarray:
+        """Reward ANY upward movement: +1 when height increases between steps."""
+        h = self._backend.get_base_pos()[:, 2]
+        prev_h = ctx.info.get("_prev_base_z", h)
+        ctx.info["_prev_base_z"] = h
+        return np.asarray((h > prev_h).astype(get_global_dtype()))
+
+    def _reward_stand_feet(self, ctx: RewardContext) -> np.ndarray:
+        """Reward standing on feet: both feet in contact AND feet near ground."""
+        h_feet_l = np.asarray(self._backend.get_sensor_data("left_foot_pos")[:, 2], dtype=get_global_dtype())
+        h_feet_r = np.asarray(self._backend.get_sensor_data("right_foot_pos")[:, 2], dtype=get_global_dtype())
+        lc = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        rc = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        on_feet = (lc | rc) & (np.abs(h_feet_l) < 0.2) & (np.abs(h_feet_r) < 0.2)
+        return np.asarray(on_feet, dtype=get_global_dtype())
+
+    def _reward_soft_symmetry(self, ctx: RewardContext) -> np.ndarray:
+        """Soft symmetry: penalize left-right action asymmetry."""
+        actions = ctx.info.get("current_actions", np.zeros((ctx.num_envs, self._num_action)))
+        # Indices 0-5 = left leg, 6-11 = right leg, 12-14 = waist
+        left_leg = actions[:, 0:6]; right_leg = actions[:, 6:12]
+        leg_asym = np.sum(np.abs(left_leg - right_leg), axis=1)
+        # Waist should be near zero
+        waist_dev = np.abs(actions[:, 12]) + np.abs(actions[:, 13])  # roll+yaw
+        return np.asarray(leg_asym + waist_dev, dtype=get_global_dtype())
+
+    def _reward_uprightness_exp(self, ctx: RewardContext) -> np.ndarray:
+        """Exponential uprightness: exp(-g_xy^2) rewards being upright."""
+        g = ctx.gravity
+        assert g is not None
+        g_xy_sq = np.square(g[:, 0]) + np.square(g[:, 1])
+        return np.asarray(np.exp(-g_xy_sq), dtype=get_global_dtype())
+
     def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
         """Orientation penalty scaled by height — gentle when near ground (getting up).
 
@@ -468,6 +537,31 @@ class G1MultiSkillEnv(G1WalkEnv):
     def obs_groups_spec(self) -> dict[str, int]:
         return {"obs": 98, "critic": 101}
 
+    def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel):
+        obs_dict = super()._compute_obs(info, linvel, gyro, gravity, dof_pos, dof_vel)
+        return obs_dict
+
+    def _geo_features(self, obs_dict: dict) -> None:
+        """Append explicit geometric features to observation dict (in-place).
+
+        Adds 4 dims: tilt angle, fall heading sin/cos, COM-support distance.
+        Gives Mamba direct geometric understanding beyond raw gravity vector.
+        """
+        g = self._backend.get_sensor_data(self._cfg.sensor.upvector)  # (B, 3)
+        tilt = np.arccos(np.clip(g[:, 2], -1.0, 1.0))  # (B,)
+        heading = np.arctan2(g[:, 1], g[:, 0])  # (B,)
+        com = np.asarray(self._backend.get_base_pos(), dtype=get_global_dtype())[:, :2]  # (B, 2)
+        rf = np.asarray(self._backend.get_sensor_data("right_foot_pos"), dtype=get_global_dtype())[:, :2]
+        com_dist = np.linalg.norm(com - rf, axis=1)  # (B,)
+        geo = np.column_stack([
+            tilt.astype(get_global_dtype()),
+            np.sin(heading).astype(get_global_dtype()),
+            np.cos(heading).astype(get_global_dtype()),
+            com_dist.astype(get_global_dtype()),
+        ])  # (B, 4)
+        for key in obs_dict:
+            obs_dict[key] = np.concatenate([obs_dict[key], geo], axis=1)
+
     def step(self, actions: np.ndarray):
         """Override to capture push forces for visualization."""
         if self._state is None:
@@ -486,6 +580,16 @@ class G1MultiSkillEnv(G1WalkEnv):
 
         self._state = state.replace(truncated=np.zeros_like(state.truncated))
         self._clear_step_final_observation()
+
+        # HoST-inspired assistive upward force: helps robot discover get-up
+        aux_scale = getattr(self, "_aux_force_scale", 1.0)
+        if aux_scale > 0:
+            h = self._backend.get_base_pos()[:, 2]
+            gap = np.maximum(0.0, 0.55 - h)
+            if np.any(gap > 0):
+                pid = getattr(self._backend, "_push_body_id", 1)
+                f_up = gap * 400.0 * aux_scale  # N per env
+                self._backend._pending_xfrc_applied[:, 6*pid+2] += np.asarray(f_up, dtype=np.float64)
 
         self._backend.step(ctrl, self._cfg.sim_substeps)
         self._state = self.update_state(self._state)

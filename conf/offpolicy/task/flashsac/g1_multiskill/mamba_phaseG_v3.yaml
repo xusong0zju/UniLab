@@ -1,0 +1,54 @@
+# @package _global_
+# Phase G v3: kneeling keyframe + assistive force + HumanUP exp rewards.
+# Larger network for multi-modal behavior: actor 256, critic 512, 3 blocks
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mujoco algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 49
+  max_iterations: 5000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 256       # up from 128
+  critic_hidden_dim: 512       # up from 256
+  algo_params:
+    actor_num_blocks: 3        # up from 2
+    critic_num_blocks: 3       # up from 2
+reward:
+  scales:
+    height_exp: 5.0
+    delta_height: 2.0
+    stand_feet: 2.5
+    uprightness_exp: 0.25
+    soft_symmetry: -1.0
+    penalty_action_rate: -0.1
+    penalty_orientation: 0.0
+    penalty_orientation_adaptive: 0.0
+    penalty_base_height: 0.0
+    penalty_ang_vel_xy: 0.0
+    pose: 0.0
+    alive: 0.0
+    tracking_lin_vel: 0.0
+    tracking_ang_vel: 0.0
+    feet_phase: 0.0
+    penalty_lifted_foot_contact: 0.0
+    penalty_support_foot_contact: 0.0
+    com_over_support: 0.0
+    penalty_close_feet_xy: 0.0
+    penalty_feet_ori: 0.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.0
+  max_tilt_deg: 180.0
+  gait_frequency: 1.2
+  feet_phase_swing_height: 0.12
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  pose_weights: [30,20,20,30,25,25, 20,15,15,25,30,30, 1,1,1, 0.05,0.05,0.05,0.05,0.05,0.05,0.05, 0.05,0.05,0.05,0.05,0.05,0.05,0.05]

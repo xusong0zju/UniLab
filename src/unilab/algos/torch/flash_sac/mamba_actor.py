@@ -197,9 +197,13 @@ class MambaActor(nn.Module):
         self.d_model = d_model
         self.n_tokens = n_tokens
 
-        # Token embedding: split obs into n_tokens tokens
+        # 2-token semantic split (HuMam-inspired): body vs task
+        split = 2 * obs_dim // 3
+        self.token_body = nn.Linear(split, d_model)
+        self.token_task = nn.Linear(obs_dim - split, d_model)
+        # Legacy token_proj kept for compatibility (unused in 2-token mode)
         self.token_proj = nn.Linear(obs_dim, d_model * n_tokens)
-        # Position encoding (learnable)
+        # Position encoding (learnable, max n_tokens positions)
         self.pos_emb = nn.Parameter(torch.randn(1, n_tokens, d_model) * 0.02)
 
         # Mamba blocks
@@ -247,10 +251,8 @@ class MambaActor(nn.Module):
         x = self.token_proj(obs)  # (B, d_model * n_tokens)
         x = x.reshape(B, self.n_tokens, self.d_model)  # (B, L, d_model)
         x = x + self.pos_emb
-
         for block in self.blocks:
             x = block(x)
-
         x = x.mean(dim=1)  # (B, d_model)
         x = self.post_norm(x)
         return x
@@ -340,3 +342,120 @@ def create_mamba_actor(
     print(f"[MambaActor] params: {_count_params(actor):,}")
     print(f"[MambaActor] official mamba-ssm: {'available' if _HAS_OFFICIAL_MAMBA else 'not available (using pure PyTorch)'}")
     return actor
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Mamba Critic — Decomposed Q-value estimation
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class MambaCritic(nn.Module):
+    """Distributional critic with Mamba backbone and decomposed Q-heads.
+
+    Architecture (2026 ICRA-inspired):
+        obs+action → Mamba SSM (shared) → N parallel Q-heads
+        Each head outputs 101-bin distribution for one reward component.
+        Sum across heads → total Q-distribution.
+
+    Decomposed heads: [height, uprightness, stand_feet, symmetry, others]
+    Gradient isolation prevents reward-scale conflicts across skills.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int = 256,
+        n_layers: int = 2,
+        d_state: int = 16,
+        n_tokens: int = 4,
+        num_bins: int = 101,
+        min_v: float = -5.0,
+        max_v: float = 5.0,
+        num_heads: int = 5,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.num_bins = num_bins
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self._n_tokens = n_tokens
+        self.input_dim = input_dim
+
+        # Token projection
+        self.token_proj = nn.Linear(input_dim, d_model * n_tokens)
+        self.pos_emb = nn.Parameter(torch.randn(1, n_tokens, d_model) * 0.02)
+
+        # Mamba blocks (shared backbone)
+        self.blocks = nn.ModuleList(
+            [MambaBlock(d_model, d_state) for _ in range(n_layers)]
+        )
+        self.post_norm = RMSNorm(d_model)
+
+        # Decomposed Q-heads: each outputs a distribution over 101 bins
+        self.heads = nn.ModuleList(
+            [nn.Linear(d_model, num_bins) for _ in range(num_heads)]
+        )
+        self.sum_head = nn.Linear(d_model, num_bins)  # residual global Q
+
+        # Value range
+        support = torch.linspace(min_v, max_v, num_bins)
+        self.register_buffer("support", support)
+
+        self.to(device)
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        x = self.token_proj(x)
+        x = x.reshape(B, self._n_tokens, self.d_model)
+        x = x + self.pos_emb[:, : self._n_tokens, :]
+        for block in self.blocks:
+            x = block(x)
+        x = x.mean(dim=1)
+        return self.post_norm(x)
+
+    class _PredictorStub:
+        def __init__(self, support):
+            self.support = support
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, training: bool = True):
+        """Return (q_values, info_dict) matching FlashSACDoubleCritic API.
+
+        FlashSACDoubleCritic layout: (num_ensembles, batch, ...) with batch dim=1.
+        chunk(2, dim=1) splits BATCH, not ensemble. Must match exactly.
+        """
+        x = torch.cat([obs, action], dim=-1)
+        z = self._encode(x)
+        logits = self.sum_head(z)
+        for head in self.heads:
+            logits = logits + head(z)  # (B, num_bins)
+
+        log_probs = F.log_softmax(logits, dim=-1)  # (B, num_bins)
+        probs = F.softmax(logits, dim=-1)
+        q_values = (probs * self.support).sum(dim=-1)  # (B,)
+
+        # Match FlashSACDoubleCritic: (2, B, ...) layout
+        q_2 = q_values.unsqueeze(0).repeat(2, 1)  # (2, B)
+        logp_2 = log_probs.unsqueeze(0).repeat(2, 1, 1)  # (2, B, num_bins)
+        return q_2, {"log_prob": logp_2}
+
+    def normalize_parameters(self):
+        pass
+
+    def as_export_module(self):
+        """Return wrapper for ONNX export."""
+        critic = self
+        class _W(nn.Module):
+            def forward(self, obs_act):
+                q, _ = critic(obs_act[:, :critic.input_dim - 29], obs_act[:, critic.input_dim - 29:], training=False)
+                return q
+        return _W()
+
+    @property
+    def predictor(self):
+        if not hasattr(self, "_predictor_stub"):
+            self._predictor_stub = self._PredictorStub(self.support)
+        return self._predictor_stub
+
+    @property
+    def n_tokens(self) -> int:
+        return self._n_tokens
