@@ -321,6 +321,91 @@ print("Motor kp:", env._motor_kp[0])  # 应与 base_kp 不同（DR 后）
 print("Motor kd:", env._motor_kd[0])
 ```
 
+### 5.5 训练卡死诊断三件套（off-policy / double-buffer）
+
+**适用场景**：训练"卡在某 iter"、GPU 掉零、events 停写。必须先区分**真卡死（死锁/hang）** vs **崩溃被吞（异常未冒泡，进程挂着不退）**——两者症状像但根因和解法不同。
+
+**第一步：看日志尾部有没有 Python traceback**（最关键，决定方向）
+
+```bash
+tail -30 /tmp/dv3_train.log
+grep -iE "error|exception|traceback|valueerror" /tmp/dv3_train.log | grep -iv "runtimewarning"
+```
+- 有 traceback → **是崩溃被吞**（见 5.5 末"崩溃被吞"），不是死锁，去修 bug。
+- 无 traceback → 进入卡死三件套判断。
+
+**第二步：卡死三件套（真死锁的判据，缺一不可）**
+
+```bash
+# (1) GPU 连续≥5次采样恒 0%（不是 0-99 波动）
+for i in $(seq 1 5); do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; sleep 2; done
+# (2) 进程 CPU TIME 不增（采样两次，TIME 该涨不涨）
+COLPID=$(pgrep -f "python3 scripts/train_offpolicy" | head -1)
+ps -p $COLPID -o time=; sleep 5; ps -p $COLPID -o time=
+# (3) events 文件停写（mtime 不变 + size 不增）
+RUNDIR=$(ls -dt logs/flash_sac/G1MultiSkill/2026-06-*_mujoco | head -1)
+stat -c'%s %y' $RUNDIR/*.tfevents*; sleep 5; stat -c'%s %y' $RUNDIR/*.tfevents*
+# (+) 僵尸 compile_worker（torch.compile 残留）
+ps -ef | awk '$2~/Z/'
+```
+- 三件套全中 → **真死锁**（多为 torch.compile recompile，解法见 5.7 方案C）。
+- 三件套不全中 → 多为慢/正常波动，不是卡死。
+
+**第三步：进程在等什么（wchan）**
+
+```bash
+cat /proc/$COLPID/wchan     # futex_wait_queue_me=等锁/同步; 0=用户态实打实在跑
+ls /proc/$COLPID/task | wc -l   # 线程数，MuJoCo 并行仿真应有数百线程
+```
+- learner wchan=0 + collector wchan=futex → learner 在 GPU 忙活、collector 等 learner（同步收集模式常见）。
+
+**可观测心跳（建议常驻代码，非调试残留）**：在 `worker.py` 加 `COLLECTOR_HEARTBEAT_EVERY=50` 每 50 步打 `[collector] step=N elapsed=Xs actor_dev=wver=N`；在 `double_buffer_runner.py` 加 `COLLECTOR_WAIT_HEARTBEAT_SEC=5`，learner 等数据超时每 5 秒打 `[runner] iter=N waiting on collector Ns buf_size=N`。卡死时一眼看出是 collector 不 step 还是 learner 不推进。
+
+**崩溃被吞的识别**：进程还在（`pgrep` 有）但 GPU=0、CPU TIME 停涨、日志无新输出也无 traceback——异常可能被外层 try 吞了。用 `py-spy dump --pid $PID` 抓栈（需 `echo 0 > /proc/sys/kernel/yama/ptrace_scope`，容器内可能被拒）；或查 stderr 是否重定向到了别处。
+
+### 5.6 Shape bug 修复验证法（np.where / broadcast）
+
+**适用场景**：`np.where`/broadcast 报 `operands could not be broadcast together with shapes A B C`。改完不能只靠肉眼看，**必须用崩溃现场的真实数值复现验证**。
+
+```bash
+# 1. 从 traceback 抄下真实 shape（如 (778,1) (389,36) (778,36)）
+# 2. 用真实 shape 构造最小复现，先复现崩、再验修复
+uv run python - <<'EOF'
+import numpy as np
+n_fallen, dim = 778, 36
+stand = np.zeros(dim); kneel = np.ones(dim)*0.5
+block_in = np.tile(stand, (n_fallen,1))
+half = n_fallen//2
+idx = np.zeros(n_fallen, bool); idx[:half]=True; np.random.shuffle(idx)
+# 旧写法（应崩）:
+try:
+    np.where(idx[:,None], np.tile(kneel,(idx.sum(),1)), block_in)
+    print("旧: 未崩(意外)")
+except ValueError as e: print("旧: 崩✓", e)
+# 新写法（应通+语义对）:
+out = np.where(idx[:,None], np.tile(kneel,(n_fallen,1)), block_in)
+assert abs(out[idx].mean()-0.5)<1e-6 and abs(out[~idx].mean())<1e-6
+print("新: 通✓ 语义✓", out.shape)
+EOF
+```
+要点：① tile 目标数用全集长度（`n_fallen`）而非子集（`idx.sum()`），三操作数同 shape 才能广播；② 验语义（kneeling 行=kneel，其余=stand），不只验不崩。
+
+### 5.7 Mamba 训练方案C（绕 recompile 死锁）
+
+**背景**：`torch.compile` 编译含 SSM 的 actor 前向时，某个 iter 触发 recompile 死锁（GPU 恒 0、有僵尸 compile_worker）。off-policy 多进程下 collector 不被编译（独立进程），死锁点在 learner 编译 SSM 处。
+
+**方案C 三件套**（任一缺失都失效）：
+
+| 措施 | 位置 | 作用 |
+|---|---|---|
+| `use_compile: false` | `conf/.../mamba_phaseD_v3.yaml` | learner 不编译 actor 前向，无 recompile |
+| `use_official: true` | `src/.../flash_sac/mamba_actor.py` | SSM 走 official CUDA kernel，不经 inductor |
+| collector actor 上 cuda | `src/.../offpolicy/worker.py`（5 处 patch） | official kernel 要 cuda 输入；collector 默认 cpu 会崩 |
+
+**代价**：collector 每步多 3 次 H2D（obs/dones/priv_info `.to(cuda)`）+ 1 次 D2H（actions `.cpu().numpy()`）。4096 env 高频下用 `timing/collector_action_select_ms` 监控，若 H2D/D2H 成瓶颈考虑 pin_memory 非阻塞拷贝。
+
+**首启动注意**：official kernel 在首个 iter 可能触发形状特化编译，**首次启动可能数分钟才出第一个 iter**（非卡死）；重启后 kernel 缓存命中则秒出。区分：看 `timing/learner_train_ms` 是否在动、CPU TIME 是否在涨。
+
 ---
 
 ## 6 关键约束速查

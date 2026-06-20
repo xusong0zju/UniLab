@@ -28,6 +28,9 @@ COLLECTOR_TIMING_KEYS = (
     "replay_ms",
     "sync_coordination_ms",
 )
+# Steps between collector stdout heartbeats. Keeps collector progress
+# observable in stdout so a stalled collector is visible without iter events.
+COLLECTOR_HEARTBEAT_EVERY = 50
 
 
 def resolve_collector_actor_dims(
@@ -383,7 +386,19 @@ def _run_collector(
     pending_collector_pack_request = None
 
     # Collection loop
+    # Periodic heartbeat so collector progress (steps, elapsed, actor device,
+    # weight version) is observable in stdout — catches a stalled collector
+    # without tensorboard/iter events.
+    collector_step = 0
+    collector_t0 = _time.time()
     while not stop_event.is_set():
+        collector_step += 1
+        if collector_step % COLLECTOR_HEARTBEAT_EVERY == 0:
+            print(
+                f"[collector] step={collector_step} elapsed={_time.time() - collector_t0:.1f}s "
+                f"actor_dev={next(actor.parameters()).device} wver={local_weight_version}",
+                flush=True,
+            )
         cycle_timing_ms: dict[str, float] = dict.fromkeys(COLLECTOR_TIMING_KEYS, 0.0)
         phase_start_ns = _time.perf_counter_ns()
 

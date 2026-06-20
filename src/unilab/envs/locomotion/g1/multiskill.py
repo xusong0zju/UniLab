@@ -212,9 +212,16 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
                 kneeling_idx = np.zeros(n_fallen, dtype=bool)
                 kneeling_idx[:half] = True
                 np.random.shuffle(kneeling_idx)
-                # Kneeling posture
-                kneel_qpos = np.tile(self._kneeling_qpos, (np.sum(kneeling_idx), 1))
-                qpos_all[is_fallen] = np.where(kneeling_idx[:, None], kneel_qpos, qpos_all[is_fallen])
+                # Build a (n_fallen, 36) array: kneeling rows take kneel posture,
+                # the rest keep qpos_all[is_fallen] (stand). All three operands
+                # of np.where must broadcast to (n_fallen, 36); tiling kneel to
+                # only (n_kneel, 36) previously crashed with shape mismatch.
+                fallen_block = np.where(
+                    kneeling_idx[:, None],
+                    np.tile(self._kneeling_qpos, (n_fallen, 1)),
+                    qpos_all[is_fallen],
+                )
+                qpos_all[is_fallen] = fallen_block
                 # Full fallen for the rest
                 n_fallen = n_fallen - half
                 is_fallen[is_fallen] = ~kneeling_idx  # only the non-kneeling ones stay as fallen

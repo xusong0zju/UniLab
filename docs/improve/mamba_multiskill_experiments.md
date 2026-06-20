@@ -106,9 +106,11 @@ obs+action(130) → token_proj → reshape(B, 4, 256) + pos_emb
 
 MambaCritic 参数少 10 倍但激活内存大 5 倍——SSM 的反向传播需要保留每个时间步的隐藏状态。
 
-## 6. D v3：反复冻结——放弃
+## 6. D v3：反复冻结——真因定位与修复（2026-06-20 更新）
 
-### 冻结模式
+> 历史结论曾记为"放弃"。2026-06-20 用 official mamba kernel 排除 recompile 死锁后，**真因暴露并被修复**：见 §6.4。原 §6.1-6.3 的历史记录保留作为排查脉络。
+
+### 6.1 冻结模式
 
 D v3 尝试了 **8 次**，每次都在 ~980 iter 冻结：
 
@@ -120,18 +122,81 @@ D v3 尝试了 **8 次**，每次都在 ~980 iter 冻结：
 | 7 | MLP Critic only | 980 | 事件停止更新 |
 | 8 | MLP Critic only | 980 | 相同 |
 
-### 可能原因
+### 6.2 可能原因（历史推测，部分已被 §6.4 证实/推翻）
 
 1. **checkpoint 保存死锁**：save_interval=1000，冻结发生在 980——刚好在首次保存前。多进程权重同步 + 磁盘写入可能触发死锁
-2. **fallen keyframe 重置异常**：episode 结束时 `_reset_done_envs()` 调用 `build_reset_plan`，fallen 姿态生成逻辑可能有边角 bug
+2. **fallen keyframe 重置异常**：episode 结束时 `_reset_done_envs()` 调用 `build_reset_plan`，fallen 姿态生成逻辑可能有边角 bug ← **§6.4 证实为此**
 3. **num_envs 不匹配**：Phase B warm-start checkpoint 训练时用 4096 envs，但 collector 进程可能用不同 env 数初始化，导致数组维度冲突
 4. **MambaCritic SSM 反向传播死锁**：Python for 循环的 `_selective_scan` 在大量迭代后积累计算图碎片
 
-### 教训
+### 6.3 教训
 
 - D v3 配置本身无致命问题（YAML 已验证，指标正常）
 - 980 iter 冻结是系统性 bug，与 critic 类型无关
 - Phase A + B 能跑完 4000 iter 证明基础架构可行，问题出在 D v3 新增的 fallen/transition/push 逻辑
+
+### 6.4 真因定位与修复（2026-06-20）
+
+#### 排除 recompile 死锁——暴露真 bug
+
+历史长期怀疑 980 冻结是 `torch.compile + 纯 PyTorch Mamba SSM` 的 recompile 死锁。2026-06-20 实施**方案C**排除该因素：
+
+| 方案C 措施 | 位置 | 作用 |
+|---|---|---|
+| `use_compile: false` | `mamba_phaseD_v3.yaml` L34 | learner 不编译 actor 前向，无 recompile |
+| `use_official: true` | `mamba_actor.py` L114 | SSM 走 official CUDA kernel，不经 inductor |
+| collector actor 上 cuda | `worker.py` L341/423/424/431/439 | official kernel 要 cuda 输入 |
+
+mamba-ssm 2.2.6 装好后 `_HAS_OFFICIAL_MAMBA=True`。重跑后 **iter 940 处仍然崩**——但这次崩因不是死锁，是 env reset 抛出明确异常，见下。
+
+#### 真因：`build_reset_plan` 的 `np.where` shape 不匹配
+
+崩点堆栈：
+```
+src/unilab/envs/locomotion/g1/multiskill.py:217, in build_reset_plan
+    qpos_all[is_fallen] = np.where(kneeling_idx[:, None], kneel_qpos, qpos_all[is_fallen])
+ValueError: operands could not be broadcast together with shapes (778,1) (389,36) (778,36)
+```
+
+**根因**：fallen env 的"半跪/全倒"姿态分配逻辑里，`np.where` 三个操作数 shape 不一致：
+
+| 操作数 | shape | 含义 |
+|---|---|---|
+| `kneeling_idx[:, None]` | (n_fallen, 1) = (778,1) | 哪些 fallen env 走半跪 |
+| `kneel_qpos` | (**n_kneel**, 36) = (389,36) | 半跪姿态，只 tile 了 kneeling 数量 |
+| `qpos_all[is_fallen]` | (n_fallen, 36) = (778,36) | 原姿态 |
+
+`np.where(cond, a, b)` 要求 `a` 能 broadcast 到 `b` 的 shape。`kneel_qpos` 是 (389,36)，`b` 是 (778,36)——**389 ≠ 778，无法 broadcast**。
+
+**为何偏偏在 ~940 iter 触发**（而非更早）：`n_fallen = int(np.sum(is_fallen))`，fallen env 数随训练推进（机器人开始倒）增多。当 fallen 数恰好使 `n_kneel (= n_fallen//2)` 与 `n_fallen` 不等时（即 n_fallen ≥ 2 起就一直不等），每次 reset 都会崩。但**只有 fallen env 数量显著增多后，该代码路径被频繁命中**，叠加 recompile 死锁的掩护，长期被误判为"980 冻结"。
+
+> 即原 §6.2 第 2 条推测"fallen keyframe 重置异常"被证实，且这正是 940/980 反复"冻结"的真因之一（另一部分是 recompile 死锁，已由方案C 解决）。
+
+#### 修复
+
+把 `kneel_qpos` 也 tile 到 `(n_fallen, 36)`，使三个操作数同 shape，kneeling 行填 kneel 姿态、其余行保留 `qpos_all[is_fallen]`（stand）：
+
+```python
+# 修复前（崩）：
+kneel_qpos = np.tile(self._kneeling_qpos, (np.sum(kneeling_idx), 1))   # (389,36)
+qpos_all[is_fallen] = np.where(kneeling_idx[:, None], kneel_qpos, qpos_all[is_fallen])  # (778,1)(389,36)(778,36) → 崩
+
+# 修复后（三操作数同 (n_fallen,36)）：
+fallen_block = np.where(
+    kneeling_idx[:, None],
+    np.tile(self._kneeling_qpos, (n_fallen, 1)),   # (778,36)
+    qpos_all[is_fallen],                            # (778,36)
+)
+qpos_all[is_fallen] = fallen_block
+```
+
+**验证**：用崩溃时的真实 shape（n_fallen=778, qpos_dim=36）复现——旧写法精确复现 `(778,1) (389,36) (778,36)` 崩溃；新写法成功，且语义校验通过（kneeling 行均值=0.5 即 kneel 姿态，非 kneeling 行均值=0.0 即 stand 姿态）。
+
+#### 教训补充
+
+- **"冻结"≠"死锁"**：iter 卡在某点 + GPU 掉零 + events 停写，可能是**崩溃被吞**（异常未冒泡到顶层，进程挂着不退）。必须看日志尾部有没有 Python traceback 才能区分。
+- **被一个 bug 掩盖的另一个 bug**：recompile 死锁（已治）长期掩盖了 reset shape bug。排除前者后，后者才暴露。复杂系统里"卡在某点"可能多个根因叠加。
+- **关键修复要用真实 shape 复现验证**：数值/shape bug 不能只靠肉眼看改对了，要用崩溃现场的真实数值构造最小复现，确认改前崩、改后通且语义对。
 
 ## 7. D v3 未完成——指标回顾（冻结前最后数据）
 

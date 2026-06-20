@@ -39,6 +39,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
     """
 
     LEARNER_LOG_INTERVAL = 10
+    # Seconds between stdout heartbeats while the learner is stalled waiting on
+    # the collector in sync-collection mode. Keeps a silent hang observable.
+    COLLECTOR_WAIT_HEARTBEAT_SEC = 5
 
     def __init__(
         self,
@@ -265,6 +268,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         training_e2e_start_ns = time.perf_counter_ns() if trace_recorder else 0
 
         # ---- training loop ----
+        # Progress heartbeat: when the learner stalls waiting on the collector
+        # (sync-collection mode), log every COLLECTOR_WAIT_HEARTBEAT_SEC so a
+        # hang is observable in stdout rather than silently blocking.
+        wait_heartbeat = 0
         for iteration in range(1, max_iterations + 1):
             # -- wait for data --
             wait_start = time.time()
@@ -275,7 +282,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 while True:
                     try:
                         collection_ready_queue.get(timeout=1.0)
+                        wait_heartbeat = 0
                     except queue.Empty:
+                        wait_heartbeat += 1
+                        if wait_heartbeat % self.COLLECTOR_WAIT_HEARTBEAT_SEC == 0:
+                            print(
+                                f"[runner] iter={iteration} waiting on collector "
+                                f"{wait_heartbeat}s buf_size={int(replay_buffer.size[0])}",
+                                flush=True,
+                            )
                         if not self._check_collector_alive():
                             self._drain_metrics(
                                 metrics_queue,
