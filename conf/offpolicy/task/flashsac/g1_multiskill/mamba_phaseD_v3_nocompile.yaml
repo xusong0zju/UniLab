@@ -11,7 +11,7 @@ training:
 algo:
   num_envs: 4096
   learning_starts: 49
-  max_iterations: 8000
+  max_iterations: 2000
   save_interval: 1000
   updates_per_step: 8
   replay_buffer_n: 256

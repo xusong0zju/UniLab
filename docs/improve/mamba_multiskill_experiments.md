@@ -1,6 +1,6 @@
 # Mamba 多技能统一策略——实验记录与初步结论
 
-> 日期：2026-06-18 | D v3 训练中 (950/8000 iters)
+> 日期：2026-06-19 | D v3 反复冻结于 ~980 iter 后放弃
 
 ## 1. 项目目标
 
@@ -106,9 +106,34 @@ obs+action(130) → token_proj → reshape(B, 4, 256) + pos_emb
 
 MambaCritic 参数少 10 倍但激活内存大 5 倍——SSM 的反向传播需要保留每个时间步的隐藏状态。
 
-## 6. D v3：当前运行阶段
+## 6. D v3：反复冻结——放弃
 
-**状态**：950/8000 iters，Mamba Actor + Mamba Critic，30N 多部位推力
+### 冻结模式
+
+D v3 尝试了 **8 次**，每次都在 ~980 iter 冻结：
+
+| 尝试 | 配置 | 冻结 iter | 现象 |
+|------|------|----------|------|
+| 1 | Mamba Actor + MLP Critic | 980 | GPU 0%, 进程存活 |
+| 2 | Mamba Actor + Mamba Critic | 980 | GPU 0%, 进程存活 |
+| 3-6 | 各种修复 | ~200-500 | 早期崩溃或冻结 |
+| 7 | MLP Critic only | 980 | 事件停止更新 |
+| 8 | MLP Critic only | 980 | 相同 |
+
+### 可能原因
+
+1. **checkpoint 保存死锁**：save_interval=1000，冻结发生在 980——刚好在首次保存前。多进程权重同步 + 磁盘写入可能触发死锁
+2. **fallen keyframe 重置异常**：episode 结束时 `_reset_done_envs()` 调用 `build_reset_plan`，fallen 姿态生成逻辑可能有边角 bug
+3. **num_envs 不匹配**：Phase B warm-start checkpoint 训练时用 4096 envs，但 collector 进程可能用不同 env 数初始化，导致数组维度冲突
+4. **MambaCritic SSM 反向传播死锁**：Python for 循环的 `_selective_scan` 在大量迭代后积累计算图碎片
+
+### 教训
+
+- D v3 配置本身无致命问题（YAML 已验证，指标正常）
+- 980 iter 冻结是系统性 bug，与 critic 类型无关
+- Phase A + B 能跑完 4000 iter 证明基础架构可行，问题出在 D v3 新增的 fallen/transition/push 逻辑
+
+## 7. D v3 未完成——指标回顾（冻结前最后数据）
 
 | 指标 | 初始 | 当前 | 趋势 |
 |------|------|------|------|

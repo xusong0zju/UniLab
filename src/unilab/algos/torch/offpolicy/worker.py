@@ -338,7 +338,7 @@ def _run_collector(
         action_dim,
         actor_hidden_dim,
         use_layer_norm,
-        "cpu",
+        "cuda",
         num_envs,
         **(actor_kwargs or {}),
     )
@@ -420,15 +420,15 @@ def _run_collector(
         # Select action
         with torch.no_grad():
             _t_infer_ns = _time.perf_counter_ns()
-            obs_torch = torch.from_numpy(obs_np_input)
-            dones_torch = torch.from_numpy(prev_dones_np)
+            obs_torch = torch.from_numpy(obs_np_input).to(next(actor.parameters()).device)
+            dones_torch = torch.from_numpy(prev_dones_np).to(next(actor.parameters()).device)
             priv_info_np = resolve_offpolicy_actor_priv_info(
                 algo_type=algo_type,
                 obs_np=obs_np,
                 critic_np=critic_np,
                 info=info_dict,
             )
-            priv_info_torch = torch.from_numpy(priv_info_np) if priv_info_np is not None else None
+            priv_info_torch = torch.from_numpy(priv_info_np).to(next(actor.parameters()).device) if priv_info_np is not None else None
             actions_torch = sample_offpolicy_actions(
                 actor=actor,
                 algo_type=algo_type,
@@ -436,7 +436,7 @@ def _run_collector(
                 prev_dones_torch=dones_torch,
                 priv_info_torch=priv_info_torch,
             )
-            actions_np = actions_torch.numpy()
+            actions_np = actions_torch.cpu().numpy()
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/actor_infer_cpu",
