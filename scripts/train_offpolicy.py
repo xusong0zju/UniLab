@@ -407,6 +407,10 @@ def play_offpolicy(algo_name: str, cfg: DictConfig) -> str | None:
         if cfg.algo.obs_normalization:
             normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
     elif algo_name == "flashsac":
+        # Pass through mamba actor config so play builds the same architecture as
+        # training. Without this, build_actor defaults to an MLP actor and the
+        # Mamba checkpoint fails to load (missing/unexpected keys).
+        _algo_params = cfg.algo.algo_params
         actor = build_actor(
             "flashsac",
             obs_dim,
@@ -414,9 +418,12 @@ def play_offpolicy(algo_name: str, cfg: DictConfig) -> str | None:
             cfg.algo.actor_hidden_dim,
             cfg.algo.use_layer_norm,
             device,
-            actor_num_blocks=cfg.algo.algo_params.actor_num_blocks,
-            actor_noise_zeta_mu=cfg.algo.algo_params.actor_noise_zeta_mu,
-            actor_noise_zeta_max=cfg.algo.algo_params.actor_noise_zeta_max,
+            actor_num_blocks=_algo_params.actor_num_blocks,
+            actor_noise_zeta_mu=_algo_params.actor_noise_zeta_mu,
+            actor_noise_zeta_max=_algo_params.actor_noise_zeta_max,
+            use_mamba_actor=getattr(_algo_params, "use_mamba_actor", False),
+            mamba_d_state=getattr(_algo_params, "mamba_d_state", 16),
+            mamba_n_tokens=getattr(_algo_params, "mamba_n_tokens", 4),
         )
         if cfg.algo.obs_normalization:
             from unilab.algos.torch.common.normalization import EmpiricalNormalization
