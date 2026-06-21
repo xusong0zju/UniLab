@@ -36,6 +36,8 @@ from unilab.envs.locomotion.g1.joystick import (
     G1WalkRewardConfig,
     InitState,
     compute_aggregated_foot_contact,
+    compute_forward_command_mask,
+    compute_forward_speed_gate,
     LEFT_FOOT_CONTACT_SENSORS,
     RIGHT_FOOT_CONTACT_SENSORS,
     zero_small_xy_commands,
@@ -156,42 +158,68 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         return float(getattr(env.cfg, "reset_base_qvel_limit", 0.05))
 
     def _sample_commands(self, env, num_reset):
+        """Sample velocity commands only (no skill flags).
+
+        Skill identity (flamingo/fallen) is set exclusively by
+        ``_sample_skill_flags`` at reset and held for the whole episode; this
+        method is reused by mid-episode command resampling to switch vx/vy
+        (walk<->run transitions) without touching identity.
+        """
         commands = super()._sample_commands(env, num_reset)
         zero_small_xy_commands(commands)
 
-        # Standing envs
+        # Standing envs: zero the command so they hold still.
         standing_prob = float(getattr(env.cfg.commands, "rel_standing_envs", 0.0))
         if standing_prob > 0.0:
             standing = np.random.uniform(size=(num_reset,)) < min(standing_prob, 1.0)
             commands[standing] = 0.0
 
-        # Flamingo envs (subset of standing)
-        flamingo_prob = float(getattr(env.cfg.commands, "rel_flamingo_envs", 0.0))
-        is_flamingo = np.random.uniform(size=(num_reset,)) < flamingo_prob if flamingo_prob > 0 else np.zeros(num_reset, dtype=bool)
-        if np.any(is_flamingo):
-            commands[is_flamingo] = 0.0
-
-        # Store flamingo flag in env for keyframe selection during build_reset_plan
-        env._is_flamingo = is_flamingo
-
-        # Fallen envs — start from a fallen posture (Phase D: fall recovery)
-        fallen_prob = float(getattr(env.cfg.commands, "rel_fallen_envs", 0.0))
-        is_fallen = np.random.uniform(size=(num_reset,)) < fallen_prob if fallen_prob > 0 else np.zeros(num_reset, dtype=bool)
-        if np.any(is_fallen):
-            commands[is_fallen] = 0.0  # stay in place while getting up
-        env._is_fallen = is_fallen
-
         if getattr(env.cfg.commands, "heading_command", False):
             commands[:, 2] = 0.0
+        return commands
+
+    def _sample_skill_flags(self, env, env_ids):
+        """Mutually-exclusive skill sampling + scatter-write to full-length flags.
+
+        Single uniform draw per env partitions into fallen / flamingo / walk:
+        ``u < fallen_prob`` -> fallen, ``fallen_prob <= u < fallen_prob +
+        flamingo_prob`` -> flamingo, otherwise walk. Writes
+        ``env._is_flamingo[env_ids]`` / ``env._is_fallen[env_ids]`` so the full
+        arrays stay aligned with all envs across the episode. Returns the
+        local (num_reset,) velocity commands, zeroed for non-walk identities.
+        """
+        num_reset = len(env_ids)
+        commands = self._sample_commands(env, num_reset)
+
+        fallen_prob = float(getattr(env.cfg.commands, "rel_fallen_envs", 0.0))
+        flamingo_prob = float(getattr(env.cfg.commands, "rel_flamingo_envs", 0.0))
+        u = np.random.uniform(size=(num_reset,))
+        is_fallen = u < fallen_prob if fallen_prob > 0 else np.zeros(num_reset, dtype=bool)
+        is_flamingo = (
+            (~is_fallen)
+            & (u < fallen_prob + flamingo_prob)
+            if (flamingo_prob > 0)
+            else np.zeros(num_reset, dtype=bool)
+        )
+        # Non-walk identities hold still: zero their velocity command.
+        non_walk = is_fallen | is_flamingo
+        if np.any(non_walk):
+            commands[non_walk] = 0.0
+
+        # Scatter-write into the full-length arrays (overwrite only reset envs).
+        env._is_flamingo[env_ids] = is_flamingo
+        env._is_fallen[env_ids] = is_fallen
         return commands
 
     def build_reset_plan(self, env, env_ids):
         """Build reset plan with per-env keyframe selection (stand vs flamingo)."""
         num_reset = len(env_ids)
-        flamingo_arr = getattr(env, "_is_flamingo", None)
-        if flamingo_arr is None or len(flamingo_arr) != env.num_envs:
-            flamingo_arr = np.zeros(env.num_envs, dtype=bool)
-        is_flamingo = flamingo_arr[env_ids]
+        # Sample skill identity FIRST: writes full-length env._is_flamingo /
+        # env._is_fallen (stable for the episode) and returns local commands.
+        commands = self._sample_skill_flags(env, env_ids)
+        # Flags are full-length and aligned; index the reset subset directly.
+        is_flamingo = env._is_flamingo[env_ids]
+        is_fallen = env._is_fallen[env_ids]
 
         # Start from stand keyframe by default
         qpos_all = np.tile(self._stand_qpos, (num_reset, 1))
@@ -200,10 +228,6 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
             qpos_all[is_flamingo] = self._flamingo_qpos
 
         # ---- Fallen postures (Phase D/G) with kneeling curriculum ----
-        fallen_arr = getattr(env, "_is_fallen", None)
-        if fallen_arr is None or len(fallen_arr) != env.num_envs:
-            fallen_arr = np.zeros(env.num_envs, dtype=bool)
-        is_fallen = fallen_arr[env_ids]
         if np.any(is_fallen):
             n_fallen = int(np.sum(is_fallen))
             # Half kneeling (easier), half full-fallen (harder)
@@ -267,7 +291,7 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
             current_actions[is_flamingo] = np.asarray(self._flamingo_ctrl, dtype=get_global_dtype())
 
         info_updates = {
-            "commands": self._sample_commands(env, num_reset),
+            "commands": commands,
             "current_actions": current_actions,
             "last_actions": zero_actions(num_reset, env._num_action),
             "gait_phase": self._sample_gait_phase(env, num_reset),
@@ -432,6 +456,8 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["stand_feet"] = self._reward_stand_feet
         self._reward_fns["soft_symmetry"] = self._reward_soft_symmetry
         self._reward_fns["uprightness_exp"] = self._reward_uprightness_exp
+        # Running flight phase reward (high-speed airborne, walk/stand envs only)
+        self._reward_fns["feet_flight"] = self._reward_feet_flight
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
@@ -465,50 +491,82 @@ class G1MultiSkillEnv(G1WalkEnv):
             kneeling_qpos=kneeling_qpos,
             kneeling_ctrl=kneeling_ctrl,
         )
-        # Flamingo flag storage for reset (resized dynamically)
-        self._is_flamingo: np.ndarray = np.zeros(0, dtype=bool)
-        self._is_fallen: np.ndarray = np.zeros(0, dtype=bool)
+        # Skill-identity flags, full num_envs length, held stable across an
+        # episode (set at reset, never overwritten by mid-episode command
+        # resampling). Kept as bool arrays so reward routing can mask by skill.
+        self._is_flamingo: np.ndarray = np.zeros(self._num_envs, dtype=bool)
+        self._is_fallen: np.ndarray = np.zeros(self._num_envs, dtype=bool)
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
 
-    # ── Flamingo-specific reward functions ───────────────────────────
+    # ── Skill masks for reward routing ──────────────────────────────
+    # Identity flags are held per-env for the whole episode (see
+    # _sample_skill_flags). Reward functions multiply by these masks so that
+    # skill-specific terms (flamingo single-leg, fallen get-up, walk gait)
+    # only act on the envs that own that skill — preventing the cross-skill
+    # leakage that previously pulled walking/standing/get-up envs into a
+    # single-leg posture.
+    def _flamingo_mask(self) -> np.ndarray:
+        return np.asarray(self._is_flamingo, dtype=get_global_dtype())
+
+    def _fallen_mask(self) -> np.ndarray:
+        return np.asarray(self._is_fallen, dtype=get_global_dtype())
+
+    def _walk_mask(self) -> np.ndarray:
+        # Walk/stand envs: neither flamingo nor fallen.
+        return np.asarray(~self._is_flamingo & ~self._is_fallen, dtype=get_global_dtype())
+
+    # ── Flamingo-specific reward functions (masked to flamingo envs) ──
     def _reward_lifted_foot_contact(self, ctx):
         left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
-        return np.asarray(left_contact, dtype=get_global_dtype())
+        return np.asarray(left_contact, dtype=get_global_dtype()) * self._flamingo_mask()
 
     def _reward_support_foot_contact(self, ctx):
         right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
-        return np.asarray(~right_contact, dtype=get_global_dtype())
+        return np.asarray(~right_contact, dtype=get_global_dtype()) * self._flamingo_mask()
 
     def _reward_com_over_support(self, ctx):
         com = np.asarray(self._backend.get_base_pos(), dtype=get_global_dtype())
         rf = np.asarray(self._backend.get_sensor_data("right_foot_pos"), dtype=get_global_dtype())
         d = np.linalg.norm(com[:, :2] - rf[:, :2], axis=1)
-        return np.asarray(np.exp(-(d**2) / 0.02), dtype=get_global_dtype())
+        return np.asarray(np.exp(-(d**2) / 0.02), dtype=get_global_dtype()) * self._flamingo_mask()
 
     # ── HumanUP-inspired GetUp rewards ──────────────────────────────
 
     def _reward_height_exp(self, ctx: RewardContext) -> np.ndarray:
-        """Exponential height reward: exp(h_base) - 1. Every cm counts."""
+        """Exponential height reward: exp(h_base) - 1. Every cm counts.
+
+        Masked to fallen envs so it only motivates getting up, not inflating
+        reward for already-standing envs (which would let tracking be ignored).
+        """
         h = self._backend.get_base_pos()[:, 2]
-        return np.asarray(np.exp(np.clip(h, 0.05, 0.8)) - 1.0, dtype=get_global_dtype())
+        return np.asarray(np.exp(np.clip(h, 0.05, 0.8)) - 1.0, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_delta_height(self, ctx: RewardContext) -> np.ndarray:
-        """Reward ANY upward movement: +1 when height increases between steps."""
+        """Reward ANY upward movement: +1 when height increases between steps.
+
+        Masked to fallen envs. NOTE: prev_h is updated for ALL envs (the side
+        effect must run every step so the next comparison is correct), only
+        the returned reward is masked.
+        """
         h = self._backend.get_base_pos()[:, 2]
         prev_h = ctx.info.get("_prev_base_z", h)
         ctx.info["_prev_base_z"] = h
-        return np.asarray((h > prev_h).astype(get_global_dtype()))
+        return np.asarray((h > prev_h).astype(get_global_dtype())) * self._fallen_mask()
 
     def _reward_stand_feet(self, ctx: RewardContext) -> np.ndarray:
-        """Reward standing on feet: both feet in contact AND feet near ground."""
+        """Reward standing on feet: both feet in contact AND feet near ground.
+
+        Masked to fallen envs — this is the terminal "stood up" bonus for the
+        get-up skill, not a general standing reward.
+        """
         h_feet_l = np.asarray(self._backend.get_sensor_data("left_foot_pos")[:, 2], dtype=get_global_dtype())
         h_feet_r = np.asarray(self._backend.get_sensor_data("right_foot_pos")[:, 2], dtype=get_global_dtype())
         lc = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
         rc = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
         on_feet = (lc | rc) & (np.abs(h_feet_l) < 0.2) & (np.abs(h_feet_r) < 0.2)
-        return np.asarray(on_feet, dtype=get_global_dtype())
+        return np.asarray(on_feet, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_soft_symmetry(self, ctx: RewardContext) -> np.ndarray:
         """Soft symmetry: penalize left-right action asymmetry."""
@@ -521,11 +579,15 @@ class G1MultiSkillEnv(G1WalkEnv):
         return np.asarray(leg_asym + waist_dev, dtype=get_global_dtype())
 
     def _reward_uprightness_exp(self, ctx: RewardContext) -> np.ndarray:
-        """Exponential uprightness: exp(-g_xy^2) rewards being upright."""
+        """Exponential uprightness: exp(-g_xy^2) rewards being upright.
+
+        Masked to fallen envs — a get-up bonus. Standing/walking envs are kept
+        upright by the general penalty_orientation term instead.
+        """
         g = ctx.gravity
         assert g is not None
         g_xy_sq = np.square(g[:, 0]) + np.square(g[:, 1])
-        return np.asarray(np.exp(-g_xy_sq), dtype=get_global_dtype())
+        return np.asarray(np.exp(-g_xy_sq), dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
         """Orientation penalty scaled by height — gentle when near ground (getting up).
@@ -541,6 +603,57 @@ class G1MultiSkillEnv(G1WalkEnv):
         # Height gate: 0.35m→0.1, 0.55m→1.0
         height_scale = np.clip((base_z - 0.35) / 0.20, 0.1, 1.0)
         return np.asarray(orientation_error * height_scale, dtype=get_global_dtype())
+
+    # ── Walking rewards (masked to walk/stand envs only) ─────────────
+    # The inherited G1WalkEnv feet_phase rewards gate on linvel, but a pushed
+    # flamingo/fallen env can momentarily have forward speed and spuriously
+    # earn a gait reward that conflicts with single-leg/get-up behavior. Gate
+    # them on the walk identity as well so they only fire for walk/stand envs.
+    def _gait_reward_gate(self, linvel: np.ndarray) -> np.ndarray:
+        min_forward_speed = getattr(self._reward_cfg, "min_forward_speed_for_gait_reward", 0.0)
+        gate = compute_forward_speed_gate(linvel, min_forward_speed)
+        return np.asarray(gate, dtype=get_global_dtype()) * self._walk_mask()
+
+    def _reward_feet_double_stance(self, ctx: RewardContext) -> np.ndarray:
+        commands = ctx.info.get("commands", np.zeros((self._num_envs, 3), dtype=get_global_dtype()))
+        left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        double_stance = np.asarray(
+            np.logical_and(left_contact, right_contact), dtype=get_global_dtype()
+        )
+        # Encourage double-stance only at walking speeds (vx < flight_speed_threshold);
+        # at running speeds the feet_flight reward owns the airborne phase, so
+        # the two never overlap (walk: vx in (0, threshold) rewards double support,
+        # run: vx >= threshold rewards flight).
+        flight_threshold = float(getattr(self._reward_cfg, "flight_speed_threshold", 1.0))
+        walk_speed = np.asarray(
+            (commands[:, 0] > 1.0e-6) & (commands[:, 0] < flight_threshold),
+            dtype=get_global_dtype(),
+        )
+        return np.asarray(double_stance * walk_speed, dtype=get_global_dtype()) * self._walk_mask()
+
+    def _reward_feet_air_time(self, ctx: RewardContext) -> np.ndarray:
+        air_time = ctx.info.get(
+            "feet_air_time", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        in_range = (air_time > 0.05) & (air_time < 0.5)
+        return np.sum(in_range.astype(float), axis=1) * self._walk_mask()
+
+    def _reward_feet_flight(self, ctx: RewardContext) -> np.ndarray:
+        """Reward the airborne (flight) phase of running: both feet off ground.
+
+        Fires only for walk/stand envs commanded above flight_speed_threshold,
+        so the policy learns a real running gait (brief double-lift) instead
+        of always keeping a foot down. Distinct from double_stance which owns
+        the low-speed double-support phase.
+        """
+        commands = ctx.info.get("commands", np.zeros((self._num_envs, 3), dtype=get_global_dtype()))
+        flight_threshold = float(getattr(self._reward_cfg, "flight_speed_threshold", 1.0))
+        left_contact = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        right_contact = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        airborne = np.asarray(~left_contact & ~right_contact, dtype=get_global_dtype())
+        fast = np.asarray(commands[:, 0] >= flight_threshold, dtype=get_global_dtype())
+        return np.asarray(airborne * fast, dtype=get_global_dtype()) * self._walk_mask()
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:
@@ -570,6 +683,32 @@ class G1MultiSkillEnv(G1WalkEnv):
         ])  # (B, 4)
         for key in obs_dict:
             obs_dict[key] = np.concatenate([obs_dict[key], geo], axis=1)
+
+    def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
+        """Override base apply_action to advance gait_phase each step.
+
+        The inherited LocomotionBaseEnv.apply_action only stores last/current
+        actions and builds ctrl — it never advances gait_phase, so the phase
+        sampled at reset stays static for the whole episode. With a static
+        phase target, the feet_phase reward encourages a fixed single-foot
+        lift instead of an alternating gait. Advance both legs phases here so
+        walking envs track a moving phase target (alternating stance/swing).
+        """
+        state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
+        state.info["current_actions"] = actions
+        exec_actions = (
+            state.info["last_actions"]
+            if self._cfg.control_config.simulate_action_latency
+            else actions
+        )
+        gait_phase = state.info.get(
+            "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
+        )
+        gait_phase[:, 0] = (gait_phase[:, 0] + self._gait_phase_delta) % (2 * np.pi)
+        gait_phase[:, 1] = (gait_phase[:, 1] + self._gait_phase_delta) % (2 * np.pi)
+        state.info["gait_phase"] = gait_phase
+        ctrl: np.ndarray = exec_actions * self._cfg.control_config.action_scale + self.default_angles
+        return ctrl
 
     def step(self, actions: np.ndarray):
         """Override to capture push forces for visualization."""
@@ -612,8 +751,13 @@ class G1MultiSkillEnv(G1WalkEnv):
         if resample_s > 0:
             resample_interval = int(resample_s / self._cfg.ctrl_dt)
             if resample_interval > 0 and self.step_counter % resample_interval == 0 and self.step_counter > 0:
-                # Resample velocity commands for all envs
+                # Resample velocity commands for all envs (walk<->run/turn
+                # transitions). Skill identity (flamingo/fallen) is held for
+                # the whole episode, so re-zero their commands after resampling.
                 new_cmds = self._dr_manager._provider._sample_commands(self, self._num_envs)
+                non_walk = self._is_flamingo | self._is_fallen
+                if np.any(non_walk):
+                    new_cmds[non_walk] = 0.0
                 self._state.info["commands"] = new_cmds
 
         if self._autoreset and np.any(self._state.terminated | self._state.truncated):
