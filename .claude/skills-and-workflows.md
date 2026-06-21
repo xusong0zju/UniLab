@@ -406,6 +406,59 @@ EOF
 
 **首启动注意**：official kernel 在首个 iter 可能触发形状特化编译，**首次启动可能数分钟才出第一个 iter**（非卡死）；重启后 kernel 缓存命中则秒出。区分：看 `timing/learner_train_ms` 是否在动、CPU TIME 是否在涨。
 
+### 5.8 Reward Hacking 诊断法（训练好但 play 崩）
+
+**症状**：训练 reward/mean 高、critic_loss 收敛、terminated_rate=0，但 sim2sim play 机器人站不住/不达标。典型 reward hacking——policy 学到捷径拿分而非目标行为。
+
+**诊断三步**：
+
+1. **跑 play 诊断脚本**（不录视频，只记数据）：
+   ```bash
+   cd /root/UniLab_WS/UniLab && export PATH=/root/miniconda3/envs/unilab/bin:$PATH
+   timeout 150 .venv/bin/python unilab_mamba/diag_play.py 2>&1 | tail -22
+   ```
+   看 base_z 曲线：稳 0.6-0.75m = 站住；秒坍到 <0.3m = hacking。CSV 在 `/tmp/dv3_play_diag.csv`。
+
+2. **查终止阈值是否失效**（hacking 最常见根因）：
+   ```bash
+   grep -n "max_tilt_deg\|min_base_height" conf/.../<task>.yaml
+   ```
+   对照已验证 baseline（如 `conf/.../g1_walk_flat/mujoco.yaml` 用 max_tilt=65/min_z=0.3；`g1_flamingo_stand` 用 60/0.35+penalty_base_height -200）。**D v3 错例：max_tilt=180/min_z=0.0 → terminated 永远 False → alive 无限白给**。
+
+3. **查 reward 函数实际注册**（改 reward 前必查 key）：
+   ```bash
+   grep -n "_reward_fns\[" src/unilab/envs/locomotion/<task>.py src/unilab/envs/locomotion/g1/joystick.py
+   ```
+   不同 env 注册的 key 不同（flamingo 有 `penalty_base_height`，joystick/multiskill 是 `base_height`）。配置里写没注册的 key 会被静默忽略。
+
+**关键指标判读**：
+- `terminated_rate=0` 可能是"站太稳"**或"终止阈值失效"**——区分看 max_tilt/min_base_height 是否合理（对照 baseline）。
+- `reward/mean` 高但 base_z 坍塌 = hacking（靠 alive/pose 白给堆出来的假象）。
+- `reward/<某项>` 持续增大 = 该项在主导，可能是 hacking 源头。
+
+详见 `docs/improve/mamba_multiskill_experiments.md` §10、`docs/improve/dv3_reward_redesign.md`。
+
+### 5.9 分阶段 Reward 调参法（不一股脑改）
+
+**原则**：reward 是高维搜索，一次改多项失败无法归因。分阶段每阶段只改 1-2 项，靠 play 诊断验证后再进下一步，失败可回退。
+
+**阶段划分（以 D v3 hacking 修复为例）**：
+
+| 阶段 | 改动 | 验证标志 | 失败回退 |
+|---|---|---|---|
+| 0 基线 | 不改 | hacking 可复现 | — |
+| 1 堵终止漏洞 | max_tilt + min_base_height（对齐 baseline） | terminated_rate 从 0 升到 >0 | 查代码路径 |
+| 2 加逼站直 | +penalty/base_height 强度惩罚 | base_z 更贴目标、terminated_rate 降 | 降强度 |
+| 3 练起身 | fallen 起始 z 抬高（高于 min_base_height） | fallen env 能起身站住 | 调起始 z |
+| 4 降白给 | alive 降 + pose 加强 | reward 不崩 | 回阶段 3 |
+| 5 技能过渡 | resampling_time>0 | 过渡不摔 | 回阶段 4 |
+
+**命门在阶段 1**：终止漏洞不堵（terminated_rate 恒 0），后面全白费。先单独验证终止生效。
+
+**参数锚点**：不拍脑袋，对齐已验证 baseline（UniLab 原版 G1 walk 的 max_tilt 65/min_z 0.3 是成熟值）。flamingo 的 60/0.35+penalty_base_height -200 是单技能站立值。D v3 多技能取 walk 值起步，再按需收紧。
+
+**续训适应期**：改 reward 后 critic 要重新适应，terminated_rate 暂时回 1.0、reward 掉是预期波动，reward/mean 升 + critic_loss 降即正常，等 ~1500-2000 iter 拐点。
+
 ---
 
 ## 6 关键约束速查

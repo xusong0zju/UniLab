@@ -43,7 +43,7 @@ env:
   reset_base_qvel_limit: 0.5
   commands:
     vel_limit: [[0.3, -0.2, -0.5], [1.2, 0.2, 0.5]]  # big stride: vx 0.3-1.2 m/s
-    resampling_time: 0.0
+    resampling_time: 8.0            # 阶段5: 0.0→8.0 训技能过渡(每8s切速度命令,mid-episode)
     rel_standing_envs: 0.25
     rel_flamingo_envs: 0.1
     rel_fallen_envs: 0.2      # 15% flamingo, 10% stand, 75% walk
@@ -103,18 +103,19 @@ reward:
     penalty_ang_vel_xy: -1.0
     penalty_orientation: -10.0
     penalty_action_rate: -5.0
-    pose: -0.5
+    pose: -0.5                      # 阶段3值(阶段4证实pose加强/alive降低都退化,保持不变)
     penalty_feet_ori: -25.0
     feet_phase: 5.0
-    alive: 10.0
+    alive: 10.0                     # 阶段4c证伪:alive10→5导致退化(撑59步vs阶段3的150步),回退10
+    base_height: -100.0           # 阶段2: 新增强度惩罚=(base_z-0.754)², 逼站直(对齐flamingo -100)
     # Flamingo rewards (registered in G1MultiSkillEnv code)
     penalty_lifted_foot_contact: -30.0
     penalty_support_foot_contact: -15.0
     com_over_support: 2.0
   tracking_sigma: 0.25
   base_height_target: 0.754
-  min_base_height: 0.0
-  max_tilt_deg: 180.0
+  min_base_height: 0.3              # 阶段1: 0.0→0.3 对齐UniLab原版walk(全倒0.15判摔,半跪0.4存活)
+  max_tilt_deg: 65.0                # 阶段1: 180→65 对齐UniLab原版walk(flamingo用60)
   gait_frequency: 1.2                # slower cadence = bigger strides
   feet_phase_swing_height: 0.12      # higher foot lift
   feet_phase_tracking_sigma: 0.005

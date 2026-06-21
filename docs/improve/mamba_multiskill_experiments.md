@@ -227,8 +227,67 @@ qpos_all[is_fallen] = fallen_block
 4. **MLP Critic 足够**——MambaCritic 的 SSM 扫描瓶颈在当前实现中得不偿失
 5. **Pose 指标会撒谎**——必须视频验证
 
-## 9. 下一步
+## 9. 下一步（2026-06-20 更新）
 
-- D v3 完成后接 Phase F（过渡 + 大步跑）
-- Sim2Sim 视频验证
-- 可选：安装官方 mamba-ssm 加速 SSM 扫描
+- ✅ D v3 reward hacking 已根除（见 §10），机器人能稳站 6 秒 + 起身见效
+- ⏳ 阶段4（降 alive 白给 + 强 pose）→ 阶段5（resampling_time 训技能过渡）
+- 待验证：行走能力（前进命令下跟踪）、技能间过渡
+- 详见 `docs/improve/dv3_reward_redesign.md`
+
+## 10. Reward Hacking 诊断与分阶段修复（2026-06-20）
+
+### 10.1 现象：训练 reward 高但 play 站不住
+
+D v3 用 §6.4 修复后的代码训到 iter 6000，训练曲线漂亮（reward/mean +255、critic_loss 1.24、terminated_rate 0），但 **sim2sim play 视频里机器人站不住**——初始 0.75m 站姿，0.5 秒坍塌到 0.22m，之后稳定趴着不动。训练 reward 高但行为失败，是典型 **reward hacking**。
+
+诊断工具：`unilab_mamba/diag_play.py`（复用 play_offpolicy 的 env+actor 构建，每步记录 base_z/cmd/action/reward，不录视频）。实测数据（model_6000）：base_z 0.339→0.137m，全程 terminated=False、reward 正。
+
+### 10.2 根因：三个约束被同时放开
+
+对照 flamingo 成功配置（`conf/.../g1_flamingo_stand/`）和 UniLab 原版 G1 walk（`conf/.../g1_walk_flat/mujoco.yaml`）：
+
+| 约束参数 | flamingo 成功 | UniLab 原版 walk | **D v3（hacking）** |
+|---|---|---|---|
+| `max_tilt_deg` | 60 | 65 | **180** |
+| `min_base_height` | 0.35 | 0.3 | **0.0** |
+| `penalty_base_height` | -200 | 无 | **无** |
+
+D v3 为训起身把终止阈值 `max_tilt 60→180` + `min_base_height 0.35→0`，并删了 `penalty_base_height`。后果：`tilt>π` 永不成立 + `base_z<0` 永不成立 → **terminated 永远 False** → `alive=+10` 每步白给 → policy 学到"趴低不摔拿分"。
+
+源码核实（`joystick.py:357-362`）：
+```python
+max_tilt_rad = deg2rad(max_tilt_deg)  # 180° = π
+tilt = arccos(clip(gravity[:,2], -1, 1))  # 永远 ≤ π
+terminated = (tilt > max_tilt_rad) | (base_z < min_base_height)  # 永远 False
+```
+`rewards.alive`（`rewards.py:182`）= 无条件 `np.ones`，不终止就给。
+
+### 10.3 关键避坑（本次踩过/差点踩的）
+
+1. **"冻结"≠"死锁"**：iter 卡在某点 + GPU 掉零 + events 停写，可能是**崩溃被吞**（异常未冒泡到顶层，进程挂着不退）。必须看日志尾部有没有 traceback 才能区分。§6.4 的 reset bug 就是被 recompile 死锁掩盖的崩溃。
+2. **被一个 bug 掩盖的另一个 bug**：recompile 死锁（已用 official kernel 治）长期掩盖了 reset shape bug；reset bug 修后，reward hacking 才暴露。复杂系统"卡在某点"可能多个根因叠加。
+3. **reward 参数不能拍脑袋，要对齐已验证的 baseline**：初版我设计 `min_base_height=0.55/max_tilt=45`（比 UniLab 原版 walk 的 0.3/65 还严），差点训不出。**校准到原版 walk 的 0.3/65 才成功**——已验证的 baseline 是最可靠的参数锚点。
+4. **reward key 要查实际注册**：flamingo 用 `penalty_base_height`（flamingo_stand.py 专有注册），但 multiskill 没注册这个 key，加了会无效。multiskill 继承的是 `base_height`（joystick 注册，`rewards.base_height=(base_z-0.754)²`）。改 reward 前必须 grep 确认 key 在当前 env 的 `_reward_fns` 里注册了。
+5. **reward 改动用真实数值复现验证**：和 shape bug 一样，不能肉眼看改对了，要用崩溃/异常现场的真实数值构造最小复现确认。
+
+### 10.4 修复：分阶段循序渐进（不一股脑改）
+
+详见 `docs/improve/dv3_reward_redesign.md` 第七节。核心：每阶段只改 1-2 项，靠 play 诊断（base_z 曲线）验证后再进下一阶段。实测进展：
+
+| 阶段 | 改动 | sim2sim 结果（model_2000） | terminated_rate |
+|---|---|---|---|
+| 基线 | 旧 reward | 秒坍趴 0.14m | 0（假象） |
+| 阶段1 | max_tilt 180→65 + min_z 0.0→0.3（对齐原版 walk） | 站满 6 秒，base_z ±6cm | 0.065 |
+| 阶段2 | +base_height: -100（强度惩罚逼站直） | 站满 6 秒，base_z ±4.5cm，更贴目标 | 0.0 |
+| 阶段3 | fallen 起始 z 0.35→0.55（练起身） | 站满 6 秒，base_z ±4.3cm + 起身见效 | 0.025 |
+
+**阶段1 是命门**——终止漏洞不堵（max_tilt/min_base_height），后面全白费（趴着仍拿分）。先单独验证终止生效（terminated_rate 从 0 升到 >0），再加强度惩罚（阶段2）、再练起身（阶段3）。
+
+### 10.5 教训补充（接 §8）
+
+6. **训练 reward 高 ≠ 行为好**：reward hacking 下 reward 曲线漂亮但 play 崩。**必须 sim2sim 验证**，且不只看 reward/mean，要看 `terminated_rate`（=0 可能是"站太稳"也可能是"终止阈值失效"的假象）、`base_height` 惩罚等。
+7. **reward 改动要循序渐进验证**：一次改多项，失败无法归因。分阶段每阶段验证一个假设。
+8. **诊断脚本要复用已验证的 env 构建路径**：自己拼 `registry.make()` 会缺注册（`ensure_registries` 没调）、缺 `env_cfg_override`（缺 reward_config）。直接 import `scripts.train_offpolicy` 的函数复用 play_offpolicy 的 env+actor 构建，避免重复踩坑。
+9. **续训 reward 改动有适应期**：改 reward 后 critic 要重新适应，terminated_rate 会暂时回到 1.0、reward 掉，是**预期波动不是失败**。reward/mean 和 critic_loss 朝对的方向走（升/降）即正常，需等 ~1500-2000 iter 拐点。
+
+

@@ -230,9 +230,11 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
                     is_fallen[:] = False
             # Random fallen posture per env: 0=supine, 1=prone, 2=side
             fallen_type = np.random.randint(0, 3, size=(int(np.sum(is_fallen)),))
-            # Base lowered to just above termination (0.35m)
+            # Base lowered to a half-kneel height (0.55m): low enough to require
+            # recovery, but above min_base_height(0.3) so it doesn't terminate
+            # instantly on reset. 阶段3: 0.35→0.55 让 fallen env 有起身机会.
             fallen_qpos = np.tile(self._stand_qpos, (n_fallen, 1))
-            fallen_qpos[:, 2] = 0.35  # base z near ground
+            fallen_qpos[:, 2] = 0.55  # half-kneel base z (above min_base_height 0.3)
             # Tilt quaternion based on type
             for i, ft in enumerate(fallen_type):
                 if ft == 0:  # supine: roll back ~80deg
