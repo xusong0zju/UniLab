@@ -13,3 +13,6 @@
 - [Mamba多技能真实评估口径](mamba-multiskill-eval-strict.md) — 用base_z+tilt自判(非state.terminated);5000远好于3000(12%vs43%),续训致退化
 - [osmesa渲染env上限](osmesa-render-env-limit.md) — EGL坏,osmesa软渲染:16envs可行/24envs死锁,靠延长steps不加env
 - [Mamba行走学成单脚跳](mamba-multiskill-gait-bug.md) — model_5000行走左脚触地率0.02;flamingo的support/lifted reward在行走下也生效致语义冲突
+- [Phase H reward routing修复](mamba-multiskill-reward-routing-fix.md) — flamingo/起身/行走reward按身份mask;行走0.02→0.38恢复双脚走/跑,腾空0.15
+- [fallen姿态bug](mamba-multiskill-fallen-pose-bug.md) — 半跪0.55非真倒地,起身瞬间完成看不到;决策起身后续专门训
+- [A8几何预处理](mamba-multiskill-geo-preprocess-a8.md) — obs 98→130(+geo3+sym29);Phase I训练terminated 10%vs21%,样本效率提升

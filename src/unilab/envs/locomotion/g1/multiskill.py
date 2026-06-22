@@ -75,6 +75,32 @@ class MultiBodyPushConfig:
     push_interval: int = 150  # steps between new push initiations
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Left/right joint pairing for symmetry features (A8.3)
+# Indices follow G1 actuator ordering (verified via mujoco mj_id2name):
+#   0-5 left leg, 6-11 right leg, 12-14 waist (center), 15-21 left arm, 22-28 right arm
+# ═══════════════════════════════════════════════════════════════════════
+
+# 13 left/right joint pairs: (left_idx, right_idx) — same joint name, opposite side.
+G1_LEFT_RIGHT_PAIRS: list[tuple[int, int]] = [
+    (0, 6),   # hip_pitch
+    (1, 7),   # hip_roll
+    (2, 8),   # hip_yaw
+    (3, 9),   # knee
+    (4, 10),  # ankle_pitch
+    (5, 11),  # ankle_roll
+    (15, 22),  # shoulder_pitch
+    (16, 23),  # shoulder_roll
+    (17, 24),  # shoulder_yaw
+    (18, 25),  # elbow
+    (19, 26),  # wrist_roll
+    (20, 27),  # wrist_pitch
+    (21, 28),  # wrist_yaw
+]
+# Center (mid-sagittal) joints — inherently symmetric, kept as-is.
+G1_CENTER_JOINT_IDX: list[int] = [12, 13, 14]  # waist yaw/roll/pitch
+
+
 @dataclass
 class MultiSkillDomainRandConfig(G1DomainRandConfig):
     """DR config with multi-body persistent push."""
@@ -657,32 +683,67 @@ class G1MultiSkillEnv(G1WalkEnv):
 
     @property
     def obs_groups_spec(self) -> dict[str, int]:
-        return {"obs": 98, "critic": 101}
+        # base 98 (gyro3+gravity3+dof_pos29+dof_vel29+action29+cmd3+phase2)
+        # + geo 3 (tilt, heading_sin, heading_cos — pure gravity-derived, batch-safe)
+        # + sym 29 (13 pairs (l+r)/2 + 13 pairs (l-r)/2 + 3 center joints)
+        # = 130 ; critic = actor + linvel 3 = 133
+        return {"obs": 130, "critic": 133}
 
     def _compute_obs(self, info, linvel, gyro, gravity, dof_pos, dof_vel):
         obs_dict = super()._compute_obs(info, linvel, gyro, gravity, dof_pos, dof_vel)
+        # A8.2 geometric invariants (SO3 partial invariants, gravity-only → batch-safe
+        # in both reset (num_reset) and step (num_envs) paths).
+        geo = self._geo_features(gravity)  # (B, 3)
+        # A8.3 left/right symmetry invariants from dof_pos.
+        sym = self._sym_features(dof_pos)  # (B, 29)
+        extra = np.concatenate([geo, sym], axis=1, dtype=get_global_dtype())  # (B, 32)
+        for key in obs_dict:
+            obs_dict[key] = np.concatenate([obs_dict[key], extra], axis=1)
         return obs_dict
 
-    def _geo_features(self, obs_dict: dict) -> None:
-        """Append explicit geometric features to observation dict (in-place).
+    def _geo_features(self, gravity: np.ndarray) -> np.ndarray:
+        """Explicit geometric invariants (SO3 partial invariants). (B, 3)
 
-        Adds 4 dims: tilt angle, fall heading sin/cos, COM-support distance.
-        Gives Mamba direct geometric understanding beyond raw gravity vector.
+        tilt, heading sin/cos. Pure functions of the gravity vector so they
+        are batch-safe in both reset (num_reset) and step (num_envs) paths —
+        no backend query (which returns full num_envs and would mismatch).
         """
-        g = self._backend.get_sensor_data(self._cfg.sensor.upvector)  # (B, 3)
+        g = np.asarray(gravity, dtype=get_global_dtype())
         tilt = np.arccos(np.clip(g[:, 2], -1.0, 1.0))  # (B,)
         heading = np.arctan2(g[:, 1], g[:, 0])  # (B,)
-        com = np.asarray(self._backend.get_base_pos(), dtype=get_global_dtype())[:, :2]  # (B, 2)
-        rf = np.asarray(self._backend.get_sensor_data("right_foot_pos"), dtype=get_global_dtype())[:, :2]
-        com_dist = np.linalg.norm(com - rf, axis=1)  # (B,)
-        geo = np.column_stack([
+        return np.column_stack([
             tilt.astype(get_global_dtype()),
             np.sin(heading).astype(get_global_dtype()),
             np.cos(heading).astype(get_global_dtype()),
-            com_dist.astype(get_global_dtype()),
-        ])  # (B, 4)
-        for key in obs_dict:
-            obs_dict[key] = np.concatenate([obs_dict[key], geo], axis=1)
+        ])  # (B, 3)
+
+    def _sym_features(self, dof_pos: np.ndarray) -> np.ndarray:
+        """Left/right symmetry invariants from joint positions. (B, 29)
+
+        For 13 left/right joint pairs: symmetric component (l+r)/2 (13 dims,
+        invariant under left-right mirror) + anti-symmetric component (l-r)/2
+        (13 dims, flips sign under mirror). Plus 3 center (mid-sagittal)
+        joints kept as-is (inherently symmetric).
+        Gives Mamba an explicit symmetry decomposition so it can implicitly
+        learn left-right equivalence without an equivariant architecture.
+        """
+        dp = np.asarray(dof_pos, dtype=get_global_dtype())
+        left_idx = np.array([p[0] for p in G1_LEFT_RIGHT_PAIRS])
+        right_idx = np.array([p[1] for p in G1_LEFT_RIGHT_PAIRS])
+        sym = (dp[:, left_idx] + dp[:, right_idx]) * 0.5  # (B, 13)
+        asym = (dp[:, left_idx] - dp[:, right_idx]) * 0.5  # (B, 13)
+        center = dp[:, np.array(G1_CENTER_JOINT_IDX, dtype=np.int64)]  # (B, 3)
+        return np.concatenate([sym, asym, center], axis=1, dtype=get_global_dtype())  # (B, 29)
+
+    def _actor_symmetry_obs_layout(self):
+        # Base layout (98) + A8 extras appended in _compute_obs:
+        #   geo 3 (SO3 invariants, identity under mirror)
+        #   sym 29 (sym/center identity, asym flips — approximated as identity
+        #          since FlashSAC double_buffer_runner does not invoke augment;
+        #          layout only needs to pass dim validation in mirror_obs).
+        from unilab.base.augmentation import SymmetryObsLayout
+        base: SymmetryObsLayout = super()._actor_symmetry_obs_layout()
+        return (*base, ("geo", 3), ("sym", 29))
 
     def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
         """Override base apply_action to advance gait_phase each step.
