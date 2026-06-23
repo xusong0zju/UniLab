@@ -119,6 +119,9 @@ class MultiSkillCommands(Commands):
 
     rel_flamingo_envs: float = 0.0  # fraction of envs in flamingo (single-leg) mode
     rel_fallen_envs: float = 0.0    # fraction of envs starting from fallen postures
+    fallen_base_z: float = 0.55     # base height of fallen posture (half-kneel).
+    # 0.55 keeps phaseI/H behavior unchanged; phaseJ lowers to 0.40 for a more
+    # pronounced get-up motion (still above min_base_height so no instant term).
 
 
 @registry.envcfg("G1MultiSkill")
@@ -135,6 +138,16 @@ class G1MultiSkillCfg(G1WalkEnvCfg):
     domain_rand: MultiSkillDomainRandConfig = field(default_factory=MultiSkillDomainRandConfig)
     reward_config: G1WalkRewardConfig | None = None
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    # HoST-inspired assistive upward force config. Defaults keep phaseI/H
+    # behavior (aux on at threshold 0.55, no decay). phaseJ tunes these for
+    # get-up curriculum (scale 1.0→0 to withdraw assistance, threshold 0.45).
+    aux_force_scale: float = 1.0
+    aux_force_threshold: float = 0.55
+    # Aux decay window in env-steps: aux_scale linearly decays 1.0→0 over
+    # [aux_decay_start_step, aux_decay_end_step] so one training run teaches
+    # stand-with-assist → stand-unassisted. Defaults 0 disable decay (phaseI/H).
+    aux_decay_start_step: int = 0
+    aux_decay_end_step: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -280,11 +293,13 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
                     is_fallen[:] = False
             # Random fallen posture per env: 0=supine, 1=prone, 2=side
             fallen_type = np.random.randint(0, 3, size=(int(np.sum(is_fallen)),))
-            # Base lowered to a half-kneel height (0.55m): low enough to require
-            # recovery, but above min_base_height(0.3) so it doesn't terminate
-            # instantly on reset. 阶段3: 0.35→0.55 让 fallen env 有起身机会.
+            # Base lowered to a half-kneel height: low enough to require
+            # recovery, but above min_base_height so it doesn't terminate
+            # instantly on reset. Read from cfg so phaseJ can lower it (0.40)
+            # without changing phaseI/H behavior (0.55).
+            fallen_base_z = float(getattr(env.cfg.commands, "fallen_base_z", 0.55))
             fallen_qpos = np.tile(self._stand_qpos, (n_fallen, 1))
-            fallen_qpos[:, 2] = 0.55  # half-kneel base z (above min_base_height 0.3)
+            fallen_qpos[:, 2] = fallen_base_z  # half-kneel base z
             # Tilt quaternion based on type
             for i, ft in enumerate(fallen_type):
                 if ft == 0:  # supine: roll back ~80deg
@@ -484,6 +499,10 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["uprightness_exp"] = self._reward_uprightness_exp
         # Running flight phase reward (high-speed airborne, walk/stand envs only)
         self._reward_fns["feet_flight"] = self._reward_feet_flight
+        # v3: route alive by command — walk envs (cmd vx != 0) get NO alive bonus,
+        # forcing them to earn via tracking instead of standing still. Standing/
+        # flamingo/fallen envs (cmd = 0) keep alive to encourage holding still.
+        self._reward_fns["alive"] = self._reward_alive
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
@@ -681,6 +700,22 @@ class G1MultiSkillEnv(G1WalkEnv):
         fast = np.asarray(commands[:, 0] >= flight_threshold, dtype=get_global_dtype())
         return np.asarray(airborne * fast, dtype=get_global_dtype()) * self._walk_mask()
 
+    def _reward_alive(self, ctx: RewardContext) -> np.ndarray:
+        """Route alive bonus by commanded speed (v3).
+
+        Walk/run envs (commanded speed != 0) get NO alive bonus — they must
+        earn via tracking_lin_vel instead of standing still to farm alive.
+        Standing / flamingo / fallen envs (command = 0) keep alive=1 to
+        encourage holding still. This breaks the "stand-and-farm" local
+        optimum that small networks fall into when alive is unconditional.
+        """
+        commands = ctx.info.get("commands", np.zeros((self._num_envs, 3), dtype=get_global_dtype()))
+        # commanded horizontal speed magnitude (vx, vy)
+        cmd_speed = np.sqrt(commands[:, 0] ** 2 + commands[:, 1] ** 2)
+        threshold = float(getattr(self._reward_cfg, "alive_cmd_threshold", 0.1))
+        # alive only where commanded speed is ~0 (stand / flamingo / fallen)
+        return np.asarray(cmd_speed < threshold, dtype=get_global_dtype())
+
     @property
     def obs_groups_spec(self) -> dict[str, int]:
         # base 98 (gyro3+gravity3+dof_pos29+dof_vel29+action29+cmd3+phase2)
@@ -782,23 +817,51 @@ class G1MultiSkillEnv(G1WalkEnv):
         if self._dr_manager is not None:
             self._dr_manager.apply_interval_randomization_if_due(self.step_counter)
 
-        pid = getattr(self._backend, "_push_body_id", 1)
-        xf = self._backend._pending_xfrc_applied[:, 6*pid:6*pid+3].copy()
-        if xf.size >= 3:
-            self._last_push_force = xf[0]
+        # Record last push force for visualization only. There is no declared
+        # SimBackend method to read staged xfrc_applied, so this is a known
+        # CLAUDE.md red-line kept isolated to the visualization path (does not
+        # affect training). Tolerant: skips if the private field is absent.
+        try:
+            pid_v = int(getattr(self._backend, "_push_body_id", 1))
+            xfrc = getattr(self._backend, "_pending_xfrc_applied", None)
+            if xfrc is not None and xfrc.shape[-1] >= 6 * pid_v + 3:
+                self._last_push_force = xfrc[:, 6 * pid_v : 6 * pid_v + 3][0].copy()
+        except (TypeError, IndexError, AttributeError):
+            pass
 
         self._state = state.replace(truncated=np.zeros_like(state.truncated))
         self._clear_step_final_observation()
 
-        # HoST-inspired assistive upward force: helps robot discover get-up
-        aux_scale = getattr(self, "_aux_force_scale", 1.0)
+        # HoST-inspired assistive upward force: helps robot discover get-up.
+        # Goes through the SimBackend.apply_body_force interface (world-frame,
+        # accumulates into the next step's xfrc_applied) instead of mutating the
+        # backend-private _pending_xfrc_applied array directly — CLAUDE.md
+        # requires env-layer to call only declared SimBackend methods.
+        aux_scale = float(getattr(self._cfg, "aux_force_scale", 1.0))
+        # Stage II aux decay: linearly decay aux_scale over a step window so the
+        # policy learns to stand without assistance within one training run
+        # (instead of training 8000 iters fully-assisted then re-training to
+        # withdraw). Defaults disable decay (start>=end) keeping phaseI/H behavior.
+        decay_start = int(getattr(self._cfg, "aux_decay_start_step", 0))
+        decay_end = int(getattr(self._cfg, "aux_decay_end_step", 0))
+        if decay_end > decay_start > 0:
+            sc = self.step_counter
+            if sc >= decay_end:
+                aux_scale = 0.0
+            elif sc > decay_start:
+                aux_scale = aux_scale * (1.0 - (sc - decay_start) / (decay_end - decay_start))
         if aux_scale > 0:
             h = self._backend.get_base_pos()[:, 2]
-            gap = np.maximum(0.0, 0.55 - h)
+            # Threshold from cfg (default 0.55 keeps phaseI/H behavior; phaseJ
+            # sets 0.45 to match its lower fallen_base_z=0.40).
+            aux_threshold = float(getattr(self._cfg, "aux_force_threshold", 0.55))
+            gap = np.maximum(0.0, aux_threshold - h)
             if np.any(gap > 0):
-                pid = getattr(self._backend, "_push_body_id", 1)
+                pid = int(getattr(self._backend, "_push_body_id", 1))
                 f_up = gap * 400.0 * aux_scale  # N per env
-                self._backend._pending_xfrc_applied[:, 6*pid+2] += np.asarray(f_up, dtype=np.float64)
+                force = np.zeros((self._num_envs, 1, 3), dtype=np.float64)
+                force[:, 0, 2] = f_up  # world-frame z+
+                self._backend.apply_body_force(np.array([pid], dtype=np.int32), force)
 
         self._backend.step(ctrl, self._cfg.sim_substeps)
         self._state = self.update_state(self._state)

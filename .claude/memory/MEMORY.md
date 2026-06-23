@@ -16,3 +16,5 @@
 - [Phase H reward routing修复](mamba-multiskill-reward-routing-fix.md) — flamingo/起身/行走reward按身份mask;行走0.02→0.38恢复双脚走/跑,腾空0.15
 - [fallen姿态bug](mamba-multiskill-fallen-pose-bug.md) — 半跪0.55非真倒地,起身瞬间完成看不到;决策起身后续专门训
 - [A8几何预处理](mamba-multiskill-geo-preprocess-a8.md) — obs 98→130(+geo3+sym29);Phase I训练terminated 10%vs21%,样本效率提升
+- [Mamba多技能参数下限](mamba-multiskill-param-floor.md) — d128宽度硬下限,0.73M/1.04M学不会走,多技能基础模型需~2M+
+- [A11 token分离失败](mamba-multiskill-a11-token-split-fail.md) — 2-token分离+去meanpool破坏走步(只取task丢body);原版4-token+meanpool能走,已回退

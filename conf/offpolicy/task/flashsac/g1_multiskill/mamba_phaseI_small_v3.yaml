@@ -1,0 +1,141 @@
+# @package _global_
+# Phase I: Phase H + A8 几何预处理 (obs 98→130: +geo3 +sym29). Fresh start, 不能续训model_8000.
+# Phase H: reward routing 修复后的全技能训练.
+# 基于 phaseD_v3, 关键变化:
+#   1. vel_limit 扩到 0~2.0 m/s 覆盖 站(0)/走(0.3-1.0)/跑(>1.0)
+#   2. 身份(flamingo/fallen)整 episode 锁定, resampling 只切 vx 不洗身份
+#   3. reward routing: flamingo 专属 reward 只对 flamingo env; 起身专属只对 fallen; 行走只对 walk
+#   4. gait_phase 每步前进(覆盖 apply_action), feet_phase 追踪动态相位
+#   5. 新增 feet_flight(高速腾空) + feet_double_stance(低速双支撑) 速度区间不重叠
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseH algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 49
+  max_iterations: 8000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 128  # 小Mamba: d_model 256→128 (1.5M→0.4M actor)
+  critic_hidden_dim: 256  # 小Mamba配套: 512→256
+  algo_params:
+    actor_num_blocks: 2  # 小Mamba: 3→2层
+    critic_num_blocks: 2  # 小Mamba配套: 3→2
+    normalize_reward: true
+    normalized_g_max: 5.0
+    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_max: 16
+    critic_min_v: -5.0
+    critic_max_v: 5.0
+    temp_initial_value: 0.01
+    temp_target_sigma: 0.15
+    n_step: 1
+    amp_dtype: auto
+    use_compile: false
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
+
+env:
+  control_config:
+    action_scale: 1.0
+  gait_phase_init_mode: "offset_phase"
+  reset_base_qvel_limit: 0.5
+  commands:
+    vel_limit: [[0.0, -0.3, -0.8], [2.0, 0.3, 0.8]]  # vx 0-2.0: 站(0)/走(0.3-1.0)/跑(>1.0)
+    resampling_time: 8.0            # 站↔走↔跑过渡, 身份整episode锁定不洗
+    rel_standing_envs: 0.20
+    rel_flamingo_envs: 0.10
+    rel_fallen_envs: 0.15
+  curriculum:
+    enabled: true
+    initial_scale: 0.5
+    min_scale: 0.5
+    max_scale: 1.0
+    level_down_threshold: 150.0
+    level_up_threshold: 750.0
+    degree: 0.001
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 0.1
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: true
+    max_force: [30, 30, 15]
+    multi_body_push:
+      push_body_names:
+        - pelvis
+        - torso_link
+        - left_shoulder_pitch_link
+        - right_shoulder_pitch_link
+        - left_elbow_link
+        - right_elbow_link
+        - left_hip_pitch_link
+        - right_hip_pitch_link
+        - left_knee_link
+        - right_knee_link
+        - left_ankle_pitch_link
+        - right_ankle_pitch_link
+      push_duration_steps: 100
+      push_interval: 150
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    # ── 通用 (所有env) ──
+    tracking_lin_vel: 2.0
+    tracking_ang_vel: 1.5
+    penalty_ang_vel_xy: -1.0
+    penalty_orientation: -10.0
+    penalty_orientation_adaptive: -5.0   # 高度自适应倾斜罚(低处宽松,起身用)
+    penalty_action_rate: -5.0
+    pose: -0.5
+    penalty_feet_ori: -25.0
+    alive: 10.0
+    base_height: -100.0
+    # ── 行走 (walk/stand env, mask=~fl&~fa) ──
+    feet_phase: 5.0
+    feet_double_stance: 1.5              # 低速(0<vx<1.0)双支撑走
+    feet_flight: 2.0                    # 高速(vx>=1.0)腾空跑
+    # ── 金鸡独立 (flamingo env, mask=is_flamingo) ──
+    penalty_lifted_foot_contact: -30.0
+    penalty_support_foot_contact: -15.0
+    com_over_support: 2.0
+    # ── 起身 (fallen env, mask=is_fallen) ──
+    height_exp: 5.0
+    delta_height: 2.0
+    stand_feet: 2.5
+    uprightness_exp: 0.25
+    soft_symmetry: -1.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.3
+  max_tilt_deg: 65.0
+  gait_frequency: 1.2
+  feet_phase_swing_height: 0.12
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  flight_speed_threshold: 1.0           # vx>=1.0 触发 feet_flight, <1.0 触发 feet_double_stance
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
