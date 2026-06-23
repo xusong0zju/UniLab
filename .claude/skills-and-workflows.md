@@ -59,6 +59,43 @@ uv run python -m unilab.visualization.playback --logdir=<path>
 uv run python -m unilab.visualization.render_many --logdir=<path>
 ```
 
+#### 1.4.1 录 play 视频标准流程（osmesa 环境，必读）
+
+本机 EGL 离屏渲染坏，MuJoCo 只能用 osmesa 软渲染录视频。osmesa 有两个坑会卡死：
+1. **env 数过多**：`play_env_num>16` 易死锁（大场景塞一个 MuJoCo 模型，osmesa 撑不住）
+2. **spawn worker 不起来**：`render_many.py` 用 multiprocessing spawn Pool，osmesa 下 worker init 静默失败，"8 processes" 实际不并行
+
+**卡死诊断信号**（任一命中即卡死，杀掉重来）：
+- 主进程 CPU 0%，子进程 CPU <10%（串行正常应 ~400%）
+- 只有 1 个 python 进程（无 8 worker）
+- 渲染跑 >15 分钟无视频落盘
+- `/dev/shm/` 有 `sem.mp-*` 残留信号量（之前卡死遗留，毒化后续渲染）
+
+**标准录视频命令**（已验证可靠）：
+```bash
+# 1. 先清残留信号量（防毒化）
+for f in /dev/shm/sem.mp-*; do [ -e "$f" ] && rm -f "$f"; done
+# 2. 串行渲染（UNILAB_RENDER_PROCESSES=1 绕过 spawn 死锁）
+MUJOCO_GL=osmesa UNILAB_RENDER_PROCESSES=1 uv run scripts/train_offpolicy.py \
+  task=flashsac/g1_multiskill/<phase> algo=flashsac \
+  training.play_only=true training.play_render_mode=record training.no_play=false \
+  training.export_onnx=false \
+  algo.load_run=<run目录名> '+algo.checkpoint=<iter>' \
+  training.play_env_num=16 training.play_steps=1000 \
+  env.aux_force_scale=0.0 \  # 起身视频禁辅助力看自主；非起身删此行
+  > logs/play_videos/xxx.log 2>&1 &
+```
+
+**要点**：
+- `UNILAB_RENDER_PROCESSES=1` 必加（强制串行，CPU 跑满多核 ~400%，8-12 分钟出片）
+- `play_env_num=16` 固定，别超（24 会死锁）
+- `+algo.checkpoint` 带 `+`（struct 模式追加字段）
+- `algo.load_run` 是 run 目录名（如 `2026-06-22_10-36-42_mujoco`）
+- 视频输出到 `<run目录>/play_video.mp4`，会覆盖该目录旧视频
+- 串行渲染**先渲染所有帧到内存，最后一次性 write_video**，渲染期间视频 mtime 不变是正常的
+
+**卡死后恢复**：杀进程 → 清 `/dev/shm/sem.mp-*` → 重新跑标准命令。详见 `.claude/memory/osmesa-render-env-limit.md`。
+
 ### 1.5 Git & PR
 
 ```bash
