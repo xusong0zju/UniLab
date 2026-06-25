@@ -143,6 +143,9 @@ class G1RewardConfig:
     min_forward_speed_for_gait_reward: float = 0.0
     close_feet_threshold: float = 0.15
     flight_speed_threshold: float = 1.0  # vx>=this -> feet_flight (run), <this -> feet_double_stance (walk)
+    # Phase P: HumanUP getup trajectory tracking
+    dof_tracking_sigma: float = 0.5
+    height_tracking_sigma: float = 0.15
     pose_weights: list[float] = field(
         default_factory=lambda: [
             0.01,

@@ -137,6 +137,8 @@ class G1MultiSkillCfg(G1WalkEnvCfg):
     commands: MultiSkillCommands = field(default_factory=MultiSkillCommands)
     domain_rand: MultiSkillDomainRandConfig = field(default_factory=MultiSkillDomainRandConfig)
     reward_config: G1WalkRewardConfig | None = None
+    # Phase P: HumanUP getup reference trajectory (29-DoF aligned npz). Empty = no tracking.
+    getup_traj_file: str = ""
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     # HoST-inspired assistive upward force config. Defaults keep phaseI/H
     # behavior (aux on at threshold 0.55, no decay). phaseJ tunes these for
@@ -267,6 +269,31 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         env._is_fallen[env_ids] = is_fallen
         return commands
 
+    def _trajectory_frame_qpos(self, env, frame: int, n: int) -> np.ndarray:
+        """Phase P: build qpos (n, nq) from HumanUP trajectory at given frame.
+
+        base_z from head_height (mapped), base quat = tilt around body y (倒地90°→站立0°),
+        joints = trajectory dof_pos. Used for phase-aligned getup start."""
+        traj_dof = env._getup_traj_dof[frame]  # (29,)
+        traj_h = float(env._getup_traj_height[frame])
+        stand = self._stand_qpos
+        qpos = np.tile(stand, (n, 1))
+        # base_z from head_height
+        base_z = 0.12 + (0.754 - 0.12) * (traj_h - 0.054) / (1.278 - 0.054)
+        qpos[:, 2] = base_z
+        # base quat: tilt around body y (倒地90°→站立0°)
+        tilt_deg = 90.0 * (1.278 - traj_h) / (1.278 - 0.054)
+        tilt_deg = max(0.0, min(90.0, tilt_deg))
+        h_half = np.deg2rad(tilt_deg) / 2
+        # base quat: tilt around body y axis. NEGATIVE sin (绕y轴-90°) for
+        # supine (back-down, g_body=[-1,0,0]). Positive gave prone (g_body=[+1,0,0]).
+        q = np.array([np.cos(h_half), 0, -np.sin(h_half), 0])
+        qpos[:, 3:7] = q
+        # joints (29)
+        na = env._num_action
+        qpos[:, 7:7 + na] = traj_dof[:na]
+        return qpos
+
     def build_reset_plan(self, env, env_ids):
         """Build reset plan with per-env keyframe selection (stand vs flamingo)."""
         num_reset = len(env_ids)
@@ -334,11 +361,30 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
                 )[0]
             qpos_all[is_fallen] = fallen_qpos
 
+        # Phase P: if getup_traj_file loaded, fallen envs start from trajectory
+        # frame-0 pose (aligned with dof/height tracking from step 0). Overrides
+        # pushover/kneeling. Done AFTER legacy fallen logic, BEFORE yaw randomization
+        # (yaw would break trajectory orientation alignment).
+        if env._getup_traj_len > 0 and np.any(is_fallen) and not getattr(env.cfg, "fallen_pushover", False):
+            # Phase P: when NOT using pushover, fallen envs start from trajectory
+            # frame-0 (stable supine, quat fixed to back-down). When pushover=true,
+            # robot starts from random grounded pose and rolls to supine on its
+            # own, then tracking triggers — so skip trajectory override.
+            n_f = int(np.sum(is_fallen))
+            traj_qpos = self._trajectory_frame_qpos(env, 0, n_f)  # (n_f, nq)
+            qpos_all[is_fallen] = traj_qpos
+
         qvel = np.tile(env._init_qvel, (num_reset, 1))
         qpos_all[:, 0:2] += np.random.uniform(-0.5, 0.5, (num_reset, 2))
         yaw = np.random.uniform(-np.pi, np.pi, (num_reset,))
-        qpos_all[:, 3:7] = np_quat_mul(qpos_all[:, 3:7], np_yaw_to_quat(yaw))
-        qpos_all[:, 0:3] = env._spawn.apply_spawn(env_ids, qpos_all[:, 0:3], yaw=yaw)
+        # Phase P: fallen+traj envs keep trajectory orientation (skip yaw rotation
+        # so tracking stays aligned). Only non-traj envs get yaw randomization.
+        if env._getup_traj_len > 0:
+            yaw_apply = np.where(is_fallen, 0.0, yaw)
+        else:
+            yaw_apply = yaw
+        qpos_all[:, 3:7] = np_quat_mul(qpos_all[:, 3:7], np_yaw_to_quat(yaw_apply))
+        qpos_all[:, 0:3] = env._spawn.apply_spawn(env_ids, qpos_all[:, 0:3], yaw=yaw_apply)
 
         limit = self._get_qvel_limit(env)
         qvel[:, 0:6] = np.random.uniform(-limit, limit, size=(num_reset, 6)).astype(get_global_dtype())
@@ -522,6 +568,9 @@ class G1MultiSkillEnv(G1WalkEnv):
         # getting up). State-gated to ground (base_z<0.40) so it only fires
         # during the roll-over phase, not after standing. Masked to fallen envs.
         self._reward_fns["roll_to_supine"] = self._reward_roll_to_supine
+        # Phase P: HumanUP reference trajectory tracking (dof + height)
+        self._reward_fns["dof_tracking"] = self._reward_dof_tracking
+        self._reward_fns["height_tracking"] = self._reward_height_tracking
         # Running flight phase reward (high-speed airborne, walk/stand envs only)
         self._reward_fns["feet_flight"] = self._reward_feet_flight
         # v3: route alive by command — walk envs (cmd vx != 0) get NO alive bonus,
@@ -536,6 +585,21 @@ class G1MultiSkillEnv(G1WalkEnv):
         flamingo_ctrl = flamingo_qpos[-self._num_action:].copy() if len(flamingo_qpos) > self._num_action else None
         kneeling_qpos = backend.get_keyframe_qpos("kneeling")
         kneeling_ctrl = kneeling_qpos[-self._num_action:].copy() if len(kneeling_qpos) > self._num_action else None
+
+        # Phase P: load HumanUP get-up reference trajectory (29-DoF aligned).
+        # Used by dof_tracking/height_tracking rewards. Optional — if file
+        # missing, tracking rewards return 0 (phaseI/H/N unaffected).
+        self._getup_traj_dof = None
+        self._getup_traj_height = None
+        self._getup_traj_len = 0
+        traj_file = str(getattr(cfg, "getup_traj_file", ""))
+        if traj_file:
+            import numpy as _np_traj
+            _td = _np_traj.load(traj_file)
+            self._getup_traj_dof = _np_traj.asarray(_td["dof_pos"], dtype=get_global_dtype())  # (T,29)
+            self._getup_traj_height = _np_traj.asarray(_td["head_height"], dtype=get_global_dtype()).flatten()  # (T,)
+            self._getup_traj_len = self._getup_traj_dof.shape[0]
+            print(f"[Phase P] loaded getup traj: {self._getup_traj_len} frames, dof{self._getup_traj_dof.shape}")
 
         base_kp, base_kd = None, None
         if cfg.domain_rand.randomize_kp or cfg.domain_rand.randomize_kd:
@@ -566,6 +630,11 @@ class G1MultiSkillEnv(G1WalkEnv):
         # resampling). Kept as bool arrays so reward routing can mask by skill.
         self._is_flamingo: np.ndarray = np.zeros(self._num_envs, dtype=bool)
         self._is_fallen: np.ndarray = np.zeros(self._num_envs, dtype=bool)
+        # Phase P: per-env tracking frame. -1 = not yet supine (rolling over),
+        # >=0 = tracking getup trajectory (incremented each step after supine trigger).
+        # Triggered when g_body·[-1,0,0] > 0.5 (reached supine). Reuses phaseN
+        # rollover ability — robot rolls to supine on its own, THEN tracking starts.
+        self._tracking_frame: np.ndarray = np.full(self._num_envs, -1, dtype=np.int32)
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
@@ -700,6 +769,37 @@ class G1MultiSkillEnv(G1WalkEnv):
         h = self._backend.get_base_pos()[:, 2]
         ground_gate = (h < 0.40).astype(get_global_dtype())
         return np.asarray(supine_score * ground_gate, dtype=get_global_dtype()) * self._fallen_mask()
+
+    def _reward_dof_tracking(self, ctx: RewardContext) -> np.ndarray:
+        """Phase P: track HumanUP get-up trajectory joint angles.
+
+        Frame = per-env _tracking_frame (supine-triggered: -1 while rolling,
+        0+ after reaching supine). Returns 0 for envs not yet supine (still
+        rolling over via phaseN ability). Masked to fallen envs."""
+        if self._getup_traj_len == 0:
+            return np.zeros(ctx.num_envs, dtype=get_global_dtype())
+        frames = np.clip(self._tracking_frame, 0, self._getup_traj_len - 1)
+        active = (self._tracking_frame >= 0).astype(get_global_dtype())  # 0 if rolling
+        ref_dof = self._getup_traj_dof[frames]  # (N, 29)
+        cur_dof = ctx.dof_pos
+        n = min(ref_dof.shape[1], cur_dof.shape[1])
+        err = np.sum(np.square(cur_dof[:, :n] - ref_dof[:, :n]), axis=1)
+        sigma = float(getattr(self._reward_cfg, "dof_tracking_sigma", 1.5))
+        return np.asarray(np.exp(-err / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
+
+    def _reward_height_tracking(self, ctx: RewardContext) -> np.ndarray:
+        """Phase P: track HumanUP get-up trajectory head/base height.
+        Supine-triggered (0 while rolling). Masked to fallen envs."""
+        if self._getup_traj_len == 0:
+            return np.zeros(ctx.num_envs, dtype=get_global_dtype())
+        frames = np.clip(self._tracking_frame, 0, self._getup_traj_len - 1)
+        active = (self._tracking_frame >= 0).astype(get_global_dtype())
+        ref_h = self._getup_traj_height[frames]
+        ref_base_z = 0.12 + (0.754 - 0.12) * (ref_h - 0.054) / (1.278 - 0.054)
+        cur_z = self._backend.get_base_pos()[:, 2]
+        err = np.square(cur_z - ref_base_z)
+        sigma = float(getattr(self._reward_cfg, "height_tracking_sigma", 0.15))
+        return np.asarray(np.exp(-err / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
 
     def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
         """Orientation penalty scaled by height — gentle when near ground (getting up).
@@ -880,6 +980,8 @@ class G1MultiSkillEnv(G1WalkEnv):
         the returned obs matches the real (grounded) qpos, not the stand pose.
         """
         obs, info = super().reset(env_indices)
+        # Phase P: reset tracking frame to -1 (not yet supine, must roll over first)
+        self._tracking_frame[env_indices] = -1
         if getattr(self._cfg, "fallen_pushover", False):
             self._fallen_pushover_warmup(env_indices)
             obs = self._recompute_reset_obs(env_indices, info)
@@ -1063,6 +1165,32 @@ class G1MultiSkillEnv(G1WalkEnv):
 
         self._state = state.replace(truncated=np.zeros_like(state.truncated))
         self._clear_step_final_observation()
+
+        # Phase P: update per-env tracking frame (supine-triggered).
+        # -1 (rolling) -> 0 when robot reaches supine (g_body·[-1,0,0] > 0.5),
+        # then increments each step. Reuses phaseN rollover: robot rolls to
+        # supine on its own, THEN tracking starts (frame aligned to supine state).
+        # IMPORTANT: use the upvector sensor (SAME source as ctx.gravity in
+        # _reward_roll_to_supine, see joystick.py _build_reward_context). Do NOT
+        # read obs[3:6] — the obs gravity is negated (-gravity, see joystick.py
+        # _compute_obs), so reading obs inverts the supine sign and the trigger
+        # never fires (this was the dof_tracking==0 root cause before this fix).
+        # NOTE: backend.get_gravity() returns the world gravity constant [0,0,-g],
+        # NOT per-env body-frame projected gravity — do not use it here.
+        if self._getup_traj_len > 0:
+            g_body = self._backend.get_sensor_data(self._cfg.sensor.upvector)  # (N,3) body-frame
+            # supine (back-down) => g_body·[-1,0,0] = -g_x ≈ +1
+            cos_supine = g_body[:, 0] * (-1.0)
+            # trigger: not yet tracking AND reached supine
+            not_triggered = self._tracking_frame < 0
+            reached_supine = cos_supine > 0.5
+            newly_triggered = not_triggered & reached_supine
+            self._tracking_frame[newly_triggered] = 0
+            # increment already-tracking envs (cap at traj_len-1, hold last frame)
+            tracking = self._tracking_frame >= 0
+            self._tracking_frame[tracking] = np.minimum(
+                self._tracking_frame[tracking] + 1, self._getup_traj_len - 1
+            )
 
         # HoST-inspired assistive upward force: helps robot discover get-up.
         # Goes through the SimBackend.apply_body_force interface (world-frame,
