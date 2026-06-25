@@ -18,3 +18,5 @@
 - [A8几何预处理](mamba-multiskill-geo-preprocess-a8.md) — obs 98→130(+geo3+sym29);Phase I训练terminated 10%vs21%,样本效率提升
 - [Mamba多技能参数下限](mamba-multiskill-param-floor.md) — d128宽度硬下限,0.73M/1.04M学不会走,多技能基础模型需~2M+
 - [A11 token分离失败](mamba-multiskill-a11-token-split-fail.md) — 2-token分离+去meanpool破坏走步(只取task丢body);原版4-token+meanpool能走,已回退
+- [起身训练失败教训](mamba-multiskill-getup-failed-lessons.md) — Phase J/K/L 8次失败:纯reward+辅助力从真倒地训不出,需参考轨迹/MPC
+- [Phase N起身成果](mamba-multiskill-phasen-getup-result.md) — 翻身100%成功(roll_to_supine), 起身0%需参考轨迹; aux撤光stand_feet稳定3.0

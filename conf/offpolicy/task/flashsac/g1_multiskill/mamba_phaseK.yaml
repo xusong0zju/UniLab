@@ -1,0 +1,125 @@
+# @package _global_
+# Phase K: 真倒地起身. 基于 phaseJ(几何obs130), 关键改动:
+#   1. fallen_pushover=true: reset 时推倒+PD控, fallen env 从真实贴地躺姿起步
+#      (替代 phaseJ 的 set_state 设倾斜, 后者被 settle 拉回直立)
+#   2. max_tilt_fallen_deg=170: fallen env 终止放宽, 允许真倒地(tilt>60)不终止
+#   3. min_base_height=0.10: 配合推倒后 base_z~0.2 不终止
+#   4. aux 衰减(step 500-5000) 保留: 托起学站立→撤辅助→自主
+# K1 验证: 推倒+PD控能成真倒地(trial0 base_z0.214 tilt81°)
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseK algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 10            # 降 from 49, 加速进learner(reset预热慢, 少等buffer)
+  max_iterations: 8000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 256
+  critic_hidden_dim: 512
+  algo_params:
+    actor_num_blocks: 3
+    critic_num_blocks: 3
+    normalize_reward: true
+    normalized_g_max: 5.0
+    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_max: 16
+    critic_min_v: -5.0
+    critic_max_v: 5.0
+    temp_initial_value: 0.01
+    temp_target_sigma: 0.15
+    n_step: 1
+    amp_dtype: auto
+    use_compile: false
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
+
+env:
+  control_config:
+    action_scale: 1.0
+  gait_phase_init_mode: "offset_phase"
+  reset_base_qvel_limit: 0.5
+  # Phase K: 推倒+PD控真倒地起步
+  fallen_pushover: true           # reset 时推倒+PD控, fallen env 真实贴地起步
+  max_tilt_fallen_deg: 170.0      # fallen 终止放宽(允许真倒地 tilt>60 不终止)
+  pushover_force: 50.0            # 推力 (N, K1验证值)
+  pushover_push_steps: 15         # 推倒步数 (K1验证)
+  pushover_settle_steps: 150      # 自由落地稳定步数 (K1验证, 需足够让机器人倒地)
+  pushover_pd_steps: 150          # PD控关节步数 (K1验证)
+  aux_force_scale: 1.0            # 辅助力起始全开(托起学站立)
+  aux_force_threshold: 0.40       # h<0.40 时给向上力(配合推倒后 base_z~0.2)
+  aux_decay_start_step: 500       # aux 衰减: step 500-5000 线性 1.0→0
+  aux_decay_end_step: 5000
+  commands:
+    vel_limit: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    resampling_time: 0.0
+    rel_standing_envs: 0.0
+    rel_flamingo_envs: 0.0
+    rel_fallen_envs: 1.0
+    fallen_base_z: 0.40           # (pushover 时被覆盖, 保留兼容)
+  curriculum:
+    enabled: false
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 0.1
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: false
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    tracking_lin_vel: 0.0
+    tracking_ang_vel: 0.0
+    penalty_ang_vel_xy: -1.0
+    penalty_orientation: -10.0
+    penalty_orientation_adaptive: -5.0
+    penalty_action_rate: -2.0
+    pose: -0.1
+    penalty_feet_ori: -10.0
+    alive: 2.0
+    base_height: -30.0
+    feet_phase: 0.0
+    feet_double_stance: 0.0
+    feet_flight: 0.0
+    penalty_lifted_foot_contact: 0.0
+    penalty_support_foot_contact: 0.0
+    com_over_support: 0.0
+    height_exp: 8.0
+    delta_height: 4.0
+    stand_feet: 5.0
+    uprightness_exp: 1.0
+    soft_symmetry: -1.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.10           # 配合推倒后 base_z~0.2 不终止
+  max_tilt_deg: 80.0              # 非fallen用(fallen由max_tilt_fallen_deg放宽)
+  gait_frequency: 1.2
+  feet_phase_swing_height: 0.12
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  flight_speed_threshold: 1.0
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]

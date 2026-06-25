@@ -1,0 +1,131 @@
+# @package _global_
+# Phase N: 翻身+起身分阶段 reward 课程(无阶段标签, 状态门控).
+# 基于 phaseK(缓存版推倒真倒地起步), 关键改动:
+#   1. 新增 roll_to_supine reward: 鼓励先翻身到仰卧(g向量夹角判据)
+#      状态门控 base_z<0.40 时生效, 站起来后不干扰
+#   2. alive=0: 关白给(phaseL教训: alive让站着划算, 不学翻身)
+#   3. uprightness_exp 1.0→3.0 加强(phaseK教训: 直立度停滞)
+#   4. pushover 80步(20+60+50, phaseL验证不拖慢collector)
+# MoE deep research 确认不引入MoE, 走分阶段reward+Mamba隐式选择
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseN algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 10
+  max_iterations: 8000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 256
+  critic_hidden_dim: 512
+  algo_params:
+    actor_num_blocks: 3
+    critic_num_blocks: 3
+    normalize_reward: true
+    normalized_g_max: 5.0
+    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_max: 16
+    critic_min_v: -5.0
+    critic_max_v: 5.0
+    temp_initial_value: 0.01
+    temp_target_sigma: 0.15
+    n_step: 1
+    amp_dtype: auto
+    use_compile: false
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
+
+env:
+  control_config:
+    action_scale: 1.0
+  gait_phase_init_mode: "offset_phase"
+  reset_base_qvel_limit: 0.5
+  # 缓存版推倒真倒地起步 (K2)
+  fallen_pushover: true
+  max_tilt_fallen_deg: 170.0      # fallen 终止放宽(允许翻身过程大倾斜不终止)
+  pushover_force: 100.0           # 推力 (N, 推shoulder力臂大, 100N够倒)
+  pushover_push_steps: 40         # 推倒步数 (需足够让翻转完成)
+  pushover_settle_steps: 100      # 自由落地稳定 (让倒地完成)
+  pushover_pd_steps: 50           # PD控保持当前关节(不拉回站立)
+  aux_force_scale: 1.0            # aux衰减课程(托起→撤)
+  aux_force_threshold: 0.40       # 贴地托起(phaseL教训: 不举到半空)
+  aux_force_gain: 150            # 轻托(phaseL验证)
+  aux_decay_start_step: 500
+  aux_decay_end_step: 5000
+  commands:
+    vel_limit: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    resampling_time: 0.0
+    rel_standing_envs: 0.0
+    rel_flamingo_envs: 0.0
+    rel_fallen_envs: 1.0
+    fallen_base_z: 0.40
+  curriculum:
+    enabled: false
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 0.1
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: false
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    # 通用
+    tracking_lin_vel: 0.0
+    tracking_ang_vel: 0.0
+    penalty_ang_vel_xy: -1.0
+    penalty_orientation: -10.0
+    penalty_orientation_adaptive: -5.0
+    penalty_action_rate: -2.0
+    pose: -0.1
+    penalty_feet_ori: -10.0
+    alive: 0.0                    # 关白给(phaseL教训)
+    base_height: -30.0
+    feet_phase: 0.0
+    feet_double_stance: 0.0
+    feet_flight: 0.0
+    penalty_lifted_foot_contact: 0.0
+    penalty_support_foot_contact: 0.0
+    com_over_support: 0.0
+    # 翻身阶段 (新增, 核心)
+    roll_to_supine: 4.0           # 鼓励翻身到仰卧(g向量夹角, base_z<0.40门控)
+    # 起身阶段 (复用phaseK)
+    height_exp: 8.0
+    delta_height: 4.0
+    stand_feet: 5.0
+    uprightness_exp: 3.0          # 加强(phaseK教训: 1.0停滞)
+    soft_symmetry: -1.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.10
+  max_tilt_deg: 80.0
+  gait_frequency: 1.2
+  feet_phase_swing_height: 0.12
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  flight_speed_threshold: 1.0
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]

@@ -1,0 +1,127 @@
+# @package _global_
+# Phase L: 起身调整(Phase K 失败后). 基于 phaseK(缓存版推倒真倒地), 关键改动:
+#   1. aux_force_gain 400→150: 轻托不举(phaseK把机器人举到0.88m半空, 撤辅助就掉)
+#   2. aux_force_threshold 0.40→0.30: 只贴地时托(h<0.30), 不托到半空
+#   3. 新增 mid_height reward: 鼓励半跪中间态(h~0.42), 引导爬起序列
+#   4. uprightness_exp 1.0→3.0: 更强逼直立(phaseK uprightness停滞0.39)
+#   5. aux 衰减 500-5000→500-7000: 慢撤给策略适应时间
+# Usage:
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseL algo=flashsac
+
+training:
+  task_name: G1MultiSkill
+  sim_backend: mujoco
+
+algo:
+  num_envs: 4096
+  learning_starts: 10
+  max_iterations: 8000
+  save_interval: 1000
+  updates_per_step: 8
+  replay_buffer_n: 256
+  tau: 0.05
+  actor_hidden_dim: 256
+  critic_hidden_dim: 512
+  algo_params:
+    actor_num_blocks: 3
+    critic_num_blocks: 3
+    normalize_reward: true
+    normalized_g_max: 5.0
+    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_max: 16
+    critic_min_v: -5.0
+    critic_max_v: 5.0
+    temp_initial_value: 0.01
+    temp_target_sigma: 0.15
+    n_step: 1
+    amp_dtype: auto
+    use_compile: false
+    use_mamba_actor: true
+    mamba_d_state: 16
+    mamba_n_tokens: 4
+
+env:
+  control_config:
+    action_scale: 1.0
+  gait_phase_init_mode: "offset_phase"
+  reset_base_qvel_limit: 0.5
+  # Phase K: 推倒+PD控真倒地起步(缓存版, reset O(1))
+  fallen_pushover: true
+  max_tilt_fallen_deg: 170.0
+  pushover_force: 50.0
+  pushover_push_steps: 15
+  pushover_settle_steps: 150
+  pushover_pd_steps: 150
+  # Phase L: 贴地轻托(不举到半空)
+  aux_force_scale: 1.0
+  aux_force_threshold: 0.30      # L: 0.40→0.30, 只贴地时托
+  aux_force_gain: 150.0          # L: 400→150, 轻托不举(phaseK举到0.88m)
+  aux_decay_start_step: 500
+  aux_decay_end_step: 7000       # L: 5000→7000, 慢撤
+  commands:
+    vel_limit: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    resampling_time: 0.0
+    rel_standing_envs: 0.0
+    rel_flamingo_envs: 0.0
+    rel_fallen_envs: 1.0
+    fallen_base_z: 0.40
+  curriculum:
+    enabled: false
+  noise_config:
+    level: 0.0
+    scale_gyro: 0.0
+    scale_gravity: 0.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 0.1
+    scale_linvel: 0.0
+  domain_rand:
+    push_robots: false
+    randomize_base_mass: true
+    added_mass_range: [-2.5, 2.5]
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.85, 1.15]
+    random_com: true
+    com_offset_x: [-0.03, 0.03]
+    randomize_ground_friction: true
+    ground_friction_multiplier_range: [0.4, 1.5]
+    randomize_kp: true
+    kp_multiplier_range: [0.85, 1.15]
+    randomize_kd: true
+    kd_multiplier_range: [0.85, 1.15]
+    randomize_gravity: true
+    gravity_range: [[0.0, 0.0, -9.81], [0.1, 0.1, -9.71]]
+
+reward:
+  scales:
+    tracking_lin_vel: 0.0
+    tracking_ang_vel: 0.0
+    penalty_ang_vel_xy: -1.0
+    penalty_orientation: -10.0
+    penalty_orientation_adaptive: -5.0
+    penalty_action_rate: -2.0
+    pose: -0.1
+    penalty_feet_ori: -10.0
+    alive: 2.0
+    base_height: -30.0
+    feet_phase: 0.0
+    feet_double_stance: 0.0
+    feet_flight: 0.0
+    penalty_lifted_foot_contact: 0.0
+    penalty_support_foot_contact: 0.0
+    com_over_support: 0.0
+    height_exp: 8.0
+    delta_height: 4.0
+    stand_feet: 5.0
+    uprightness_exp: 3.0          # L: 1.0→3.0, 强逼直立
+    mid_height: 3.0               # L: 新增, 鼓励半跪中间态(h~0.42)
+    soft_symmetry: -1.0
+  tracking_sigma: 0.25
+  base_height_target: 0.754
+  min_base_height: 0.10
+  max_tilt_deg: 80.0
+  gait_frequency: 1.2
+  feet_phase_swing_height: 0.12
+  feet_phase_tracking_sigma: 0.005
+  close_feet_threshold: 0.15
+  flight_speed_threshold: 1.0
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]

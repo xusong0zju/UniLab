@@ -148,6 +148,23 @@ class G1MultiSkillCfg(G1WalkEnvCfg):
     # stand-with-assist → stand-unassisted. Defaults 0 disable decay (phaseI/H).
     aux_decay_start_step: int = 0
     aux_decay_end_step: int = 0
+    # Phase K: pushover get-up. When True, fallen envs are pushed over (stand→
+    # random-direction force→ settle→ PD to randomized lie joints) during reset
+    # so they start episodes from a real grounded pose (not the settle-straight
+    # pose). Defaults False keeps phaseI/H/J behavior.
+    fallen_pushover: bool = False
+    # Max tilt (deg) for fallen envs before termination. phaseK sets 170 to
+    # allow true grounded poses (tilt>60) to not instantly terminate. Other envs
+    # still use max_tilt_deg. Default 80 keeps old behavior.
+    max_tilt_fallen_deg: float = 80.0
+    pushover_force: float = 50.0       # push magnitude (N) during pushover
+    pushover_push_steps: int = 15      # steps applying push force
+    pushover_settle_steps: int = 150   # free-fall settle steps
+    pushover_pd_steps: int = 150       # PD-control to lie-joint steps
+    # Phase L: assistive force gain (N per meter of gap). Default 400 keeps
+    # phaseI/H/J behavior. phaseL lowers to 150 so assist nudges near ground
+    # instead of lifting the robot airborne (phaseK lifted to base_z 0.88).
+    aux_force_gain: float = 400.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -497,6 +514,14 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["stand_feet"] = self._reward_stand_feet
         self._reward_fns["soft_symmetry"] = self._reward_soft_symmetry
         self._reward_fns["uprightness_exp"] = self._reward_uprightness_exp
+        # Phase L: mid-height reward encourages the half-kneel intermediate state
+        # (base_z in [0.30,0.55]) so the policy learns to climb from ground to
+        # kneeling before standing — not just lift to standing in one shot.
+        self._reward_fns["mid_height"] = self._reward_mid_height
+        # Phase N: roll-to-supine reward (encourage rolling to face-up before
+        # getting up). State-gated to ground (base_z<0.40) so it only fires
+        # during the roll-over phase, not after standing. Masked to fallen envs.
+        self._reward_fns["roll_to_supine"] = self._reward_roll_to_supine
         # Running flight phase reward (high-speed airborne, walk/stand envs only)
         self._reward_fns["feet_flight"] = self._reward_feet_flight
         # v3: route alive by command — walk envs (cmd vx != 0) get NO alive bonus,
@@ -544,6 +569,12 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
+        # Phase K: cache of pre-generated grounded-lie qpos (generated once at
+        # init via pushover, then reset just samples from cache + perturbation —
+        # avoids running 315 physics steps per reset which crippled the collector.
+        self._fallen_qpos_cache: np.ndarray | None = None
+        if getattr(cfg, "fallen_pushover", False):
+            self._fallen_qpos_cache = self._pregenerate_fallen_cache(n_cache=24)
 
     # ── Skill masks for reward routing ──────────────────────────────
     # Identity flags are held per-env for the whole episode (see
@@ -633,6 +664,42 @@ class G1MultiSkillEnv(G1WalkEnv):
         assert g is not None
         g_xy_sq = np.square(g[:, 0]) + np.square(g[:, 1])
         return np.asarray(np.exp(-g_xy_sq), dtype=get_global_dtype()) * self._fallen_mask()
+
+    def _reward_mid_height(self, ctx: RewardContext) -> np.ndarray:
+        """Phase L: reward the half-kneel intermediate height (base_z ~0.42m).
+
+        Gaussian peak at h=0.42 (half-kneel between ground 0.16 and stand 0.754).
+        Encourages climbing from ground to kneeling before standing. Masked to
+        fallen envs. Helps the policy discover the get-up motion sequence by
+        rewarding intermediate progress (not only the final standing state).
+        """
+        h = self._backend.get_base_pos()[:, 2]
+        r = np.exp(-np.square((h - 0.42) / 0.12))
+        return np.asarray(r, dtype=get_global_dtype()) * self._fallen_mask()
+
+    def _reward_roll_to_supine(self, ctx: RewardContext) -> np.ndarray:
+        """Phase N: encourage rolling to supine (face-up, back-down) before get-up.
+
+        Uses the FULL gravity vector angle against the canonical supine target.
+        G1 body frame (verified 2026-06-24): +x=front(chest), +y=left, +z=up(head).
+        Standing g_body=[0,0,-1] (gravity to feet/-z). The BACK faces body -x.
+        Supine (back on ground) => back(-x) aligns with world gravity(-z), so
+        world gravity [0,0,-1] projects to body [-1,0,0]. => g_target=[-1,0,0].
+
+        Prone (face-down, chest to ground) => g_body=[+1,0,0] (opposite).
+        Side-lying (left/right arm down) => g_body≈[0,±1,0].
+        Real fallen poses scatter across all these; roll_to_supine guides to [-1,0,0].
+
+        State-gated to ground (base_z<0.40). Masked to fallen envs. sigma=0.40.
+        """
+        g = ctx.gravity
+        assert g is not None
+        g_target = np.array([-1.0, 0.0, 0.0], dtype=get_global_dtype())  # back-down
+        cos_angle = np.clip(g @ g_target, -1.0, 1.0)  # (N,)
+        supine_score = np.exp(-np.square((1.0 - cos_angle) / 0.40))
+        h = self._backend.get_base_pos()[:, 2]
+        ground_gate = (h < 0.40).astype(get_global_dtype())
+        return np.asarray(supine_score * ground_gate, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
         """Orientation penalty scaled by height — gentle when near ground (getting up).
@@ -806,6 +873,171 @@ class G1MultiSkillEnv(G1WalkEnv):
         ctrl: np.ndarray = exec_actions * self._cfg.control_config.action_scale + self.default_angles
         return ctrl
 
+    # ── Phase K: pushover get-up reset ───────────────────────────────
+    def reset(self, env_indices: np.ndarray):
+        """Standard reset, then (if fallen_pushover) push fallen envs over and
+        PD-control them into a randomized grounded lie pose. Recomputes obs so
+        the returned obs matches the real (grounded) qpos, not the stand pose.
+        """
+        obs, info = super().reset(env_indices)
+        if getattr(self._cfg, "fallen_pushover", False):
+            self._fallen_pushover_warmup(env_indices)
+            obs = self._recompute_reset_obs(env_indices, info)
+        return obs, info
+
+    def _pregenerate_fallen_cache(self, n_cache: int = 24) -> np.ndarray:
+        """Run pushover+PD once at init to generate a cache of n_cache grounded-lie
+        qpos (n_cache, nq). Reset then samples from cache + small perturbation
+        (O(1), no physics) instead of running 315 steps per reset (which crippled
+        the collector). Uses a temp single-env run to avoid disturbing the pool."""
+        cfg = self._cfg
+        provider = self._dr_manager._provider
+        stand_qpos = provider._stand_qpos
+        stand_ctrl = stand_qpos[-self._num_action:].copy()
+        nq = self._backend._model.nq
+        nv = self._backend._model.nv
+        N = self._num_envs
+        # Push the SHOULDER (not pelvis) for a large lever arm above the CoM so
+        # the push force produces a toppling TORQUE, not just translation.
+        # Pushing pelvis (CoM height) only slides the robot without toppling
+        # (verified: 500N on pelvis => 0% fall; 100N on shoulder => 100% fall).
+        import mujoco as _mj
+        _push_body_name = getattr(cfg, "pushover_body_name", "left_shoulder_pitch_link")
+        pid = int(_mj.mj_name2id(self._backend._model, _mj.mjtObj.mjOBJ_BODY, _push_body_name))
+        if pid <= 0:
+            pid = int(getattr(self._backend, "_push_body_id", 1))  # fallback pelvis
+        pf = float(getattr(cfg, "pushover_force", 50.0))
+        push_steps = int(getattr(cfg, "pushover_push_steps", 15))
+        settle_steps = int(getattr(cfg, "pushover_settle_steps", 150))
+        pd_steps = int(getattr(cfg, "pushover_pd_steps", 150))
+        cache = []
+        # Generate n_cache poses by running pushover on the full pool (all envs
+        # participate; we collect each env's final qpos as a cache entry, repeat
+        # until we have n_cache distinct ones).
+        batch = 0
+        while len(cache) < n_cache:
+            batch += 1
+            # reset all envs to stand (upright, random yaw)
+            qpos_stand = np.tile(stand_qpos, (N, 1))
+            qpos_stand[:, 0:2] += np.random.uniform(-0.3, 0.3, (N, 2))
+            yaw = np.random.uniform(-np.pi, np.pi, (N,))
+            from unilab.envs.common.rotation import np_yaw_to_quat as _yaw_q
+            qpos_stand[:, 3:7] = np_quat_mul(qpos_stand[:, 3:7], _yaw_q(yaw))
+            self._backend.set_state(np.arange(N, dtype=np.int32), qpos_stand, np.zeros((N, nv)))
+            push_ang = np.random.uniform(0, 2 * np.pi, (N,))
+            ctrl_stand = np.tile(stand_ctrl, (N, 1)).astype(get_global_dtype())
+            ctrl_zero = np.zeros((N, self._num_action), dtype=get_global_dtype())
+            # Randomize push body per batch across high-leverage upper-body
+            # sites (shoulder pitch/roll/yaw, left & right) so falls cover
+            # diverse directions — not always the same shoulder. All are above
+            # the CoM (z>0.9) so the push topples rather than slides.
+            import mujoco as _mj2
+            _push_bodies = [
+                "left_shoulder_pitch_link", "right_shoulder_pitch_link",
+                "left_shoulder_roll_link", "right_shoulder_roll_link",
+                "left_shoulder_yaw_link", "right_shoulder_yaw_link",
+            ]
+            _push_ids = [
+                _mj2.mj_name2id(self._backend._model, _mj2.mjtObj.mjOBJ_BODY, n)
+                for n in _push_bodies
+            ]
+            _push_ids = [b for b in _push_ids if b > 0]
+            batch_pid = int(np.random.choice(_push_ids)) if _push_ids else pid
+            # Push phase: ctrl=stand (lock upright, stiff) so the push force
+            # topples the robot as a rigid body. (ctrl=0 makes legs buckle and
+            # absorbs the push without toppling.)
+            for _ in range(push_steps):
+                force = np.zeros((N, 1, 3))
+                force[:, 0, 0] = pf * np.cos(push_ang)
+                force[:, 0, 1] = pf * np.sin(push_ang)
+                self._backend.apply_body_force(np.array([batch_pid], dtype=np.int32), force)
+                self._backend.step(ctrl_stand, 1)
+            for _ in range(settle_steps):
+                self._backend.step(ctrl_zero, 1)
+            # PD phase: drive joints to an EXTENDED lie target (elbows straight,
+            # arms alongside body) so the cached pose is a natural extended lie,
+            # not retaining fall-time elbow flex. Previously used cur_dof which
+            # kept ~90° elbow bend from the fall.
+            lie_target = self._sample_lie_joints(N)
+            for _ in range(pd_steps):
+                self._backend.step(lie_target.astype(get_global_dtype()), 1)
+            # collect final qpos, filter to real grounded poses
+            cur = self._backend._physics_state[:, self._backend._idx_qpos : self._backend._idx_qpos + nq].copy()
+            bz = cur[:, 2]
+            # tilt from gravity
+            grav = self._backend.get_sensor_data(self._cfg.sensor.upvector)
+            tilt = np.degrees(np.arccos(np.clip(np.abs(grav[:, 2]), 0, 1)))
+            grounded = (bz < 0.45) & (tilt > 50)
+            for i in np.where(grounded)[0]:
+                cache.append(cur[i].copy())
+                if len(cache) >= n_cache:
+                    break
+            if batch > 5:
+                break  # safety: don't loop forever if pushover fails
+        if len(cache) == 0:
+            # fallback: use stand (shouldn't happen, but don't crash init)
+            cache = [stand_qpos.copy()]
+        return np.stack(cache[:n_cache] if len(cache) >= n_cache else cache)
+
+    def _fallen_pushover_warmup(self, env_ids: np.ndarray) -> None:
+        """Sample grounded-lie qpos from the pre-generated cache + small
+        perturbation, set_state directly (no physics warmup at reset time).
+        O(1) per reset — does not slow the collector."""
+        if self._fallen_qpos_cache is None or len(self._fallen_qpos_cache) == 0:
+            return
+        nq = self._backend._model.nq
+        nv = self._backend._model.nv
+        is_fallen = np.asarray(self._is_fallen)
+        N = self._num_envs
+        cache = self._fallen_qpos_cache
+        n_cache = len(cache)
+        # sample a cache entry per env (cycle if more envs than cache)
+        idx = np.random.randint(0, n_cache, size=(N,))
+        qpos = np.tile(cache[0], (N, 1))
+        qpos[:] = cache[idx]
+        # small perturbation: xy position + joint noise
+        qpos[:, 0:2] += np.random.uniform(-0.15, 0.15, (N, 2))
+        joint_noise = np.random.uniform(-0.1, 0.1, (N, self._num_action))
+        qpos[:, 7 : 7 + self._num_action] += joint_noise
+        # zero velocities
+        self._backend.set_state(np.arange(N, dtype=np.int32), qpos, np.zeros((N, nv)))
+
+    def _sample_lie_joints(self, n: int) -> np.ndarray:
+        """Randomized grounded-lie joint targets (n, num_action).
+
+        Body EXTENDED on the ground (real supine/prone lie, not curled):
+        - elbows STRAIGHT (0 rad, not the 34° default) — arms extended along body
+        - knees near straight (small flex, legs extended)
+        - shoulders arms alongside body (not splayed)
+        - small perturbations simulate natural ground settling.
+        Previously PD used cur_dof (retained fall-time elbow flex ~90°)."""
+        da = self.default_angles  # (num_action,) stand/default joints
+        j = np.tile(da, (n, 1)).astype(np.float64)
+        # G1 joint layout (0-28): 0-5 left leg, 6-11 right leg, 12-14 waist,
+        # 15-20 left arm, 21-26 right arm. (hip_pitch=0/6, knee=3/9, elbow=18/24)
+        for lr in (0, 6):  # left/right leg base index
+            j[:, lr] += np.random.uniform(-0.2, 0.2, n)      # hip_pitch
+            j[:, lr + 1] += np.random.uniform(-0.1, 0.1, n)  # hip_roll
+            j[:, lr + 3] = np.random.uniform(-0.1, 0.2, n)   # knee (near straight, slight flex)
+            j[:, lr + 4] += np.random.uniform(-0.1, 0.1, n)  # ankle_pitch
+            j[:, lr + 5] += np.random.uniform(-0.1, 0.1, n)  # ankle_roll
+        j[:, 12] += np.random.uniform(-0.1, 0.1, n)  # waist yaw
+        j[:, 13] += np.random.uniform(-0.1, 0.1, n)  # waist roll
+        j[:, 14] += np.random.uniform(-0.1, 0.1, n)  # waist pitch
+        for lr in (15, 21):  # left/right arm
+            j[:, lr] = np.random.uniform(-0.1, 0.1, n)      # shoulder_pitch (arms alongside body, not splayed)
+            j[:, lr + 1] += np.random.uniform(-0.1, 0.1, n)  # shoulder_roll
+            j[:, lr + 2] += np.random.uniform(-0.1, 0.1, n)  # shoulder_yaw
+            j[:, lr + 3] = np.random.uniform(-0.1, 0.1, n)   # elbow STRAIGHT (0 rad, not 34° default)
+        return j
+
+    def _recompute_reset_obs(self, env_ids: np.ndarray, info: dict) -> dict:
+        """Recompute reset obs from current (post-warmup) physics state.
+        build_reset_observation fetches linvel/gyro/gravity/dof_pos/dof_vel
+        internally from the backend, so obs matches the real grounded qpos."""
+        provider = self._dr_manager._provider
+        return provider.build_reset_observation(self, env_ids, info)
+
     def step(self, actions: np.ndarray):
         """Override to capture push forces for visualization."""
         if self._state is None:
@@ -858,13 +1090,34 @@ class G1MultiSkillEnv(G1WalkEnv):
             gap = np.maximum(0.0, aux_threshold - h)
             if np.any(gap > 0):
                 pid = int(getattr(self._backend, "_push_body_id", 1))
-                f_up = gap * 400.0 * aux_scale  # N per env
+                # Phase L: gain configurable (default 400 keeps phaseI/H/J behavior;
+                # phaseL sets 150 so assist only nudges near ground, doesn't lift
+                # the robot into the air — phaseK lifted to base_z 0.88, too high).
+                aux_gain = float(getattr(self._cfg, "aux_force_gain", 400.0))
+                f_up = gap * aux_gain * aux_scale  # N per env
                 force = np.zeros((self._num_envs, 1, 3), dtype=np.float64)
                 force[:, 0, 2] = f_up  # world-frame z+
                 self._backend.apply_body_force(np.array([pid], dtype=np.int32), force)
 
         self._backend.step(ctrl, self._cfg.sim_substeps)
         self._state = self.update_state(self._state)
+        # Phase K: relax termination for fallen envs so true grounded poses
+        # (tilt>60, low base_z) don't instantly terminate. Non-fallen envs keep
+        # the base max_tilt_deg/min_base_height. Default max_tilt_fallen_deg=80
+        # keeps phaseI/H/J behavior unchanged.
+        max_tilt_fallen = float(getattr(self._cfg, "max_tilt_fallen_deg", 80.0))
+        if max_tilt_fallen > self._reward_cfg.max_tilt_deg and np.any(self._is_fallen):
+            grav = self._backend.get_sensor_data(self._cfg.sensor.upvector)
+            tilt = np.arccos(np.clip(grav[:, 2], -1, 1))
+            fallen_strict = (tilt > np.deg2rad(self._reward_cfg.max_tilt_deg)) | (
+                self._terrain_relative_base_height() < self._reward_cfg.min_base_height
+            )
+            fallen_relaxed = (tilt > np.deg2rad(max_tilt_fallen)) | (
+                self._terrain_relative_base_height() < self._reward_cfg.min_base_height
+            )
+            # fallen envs use relaxed threshold; non-fallen keep strict
+            new_term = np.where(self._is_fallen, fallen_relaxed, fallen_strict)
+            self._state = self._state.replace(terminated=new_term.astype(self._state.terminated.dtype))
         self._state.info["steps"] += 1
         self.step_counter += 1
         t = self._compute_truncated(self._state)
