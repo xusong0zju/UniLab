@@ -38,6 +38,11 @@ class GravityCompController(MotorController):
         force_upper: np.ndarray,
         gravity_comp_mask: np.ndarray | None = None,
         gravity_scale: float = 1.0,
+        # Phase P 三基准GC: support-chain joint masks (boolean, nv_act length).
+        # g_foot = g_total-g_pelvis on foot chain, g_pelvis elsewhere.
+        # g_hand = g_total-g_pelvis on hand chain, g_pelvis elsewhere.
+        foot_chain_mask: np.ndarray | None = None,
+        hand_chain_mask: np.ndarray | None = None,
     ) -> None:
         self._dynamics_model = dynamics_model
         self._kp = np.asarray(kp, dtype=np.float64)
@@ -49,6 +54,13 @@ class GravityCompController(MotorController):
             self._gravity_comp_mask = np.asarray(gravity_comp_mask, dtype=np.float64)
         else:
             self._gravity_comp_mask = None
+        # Phase P 三基准GC chain masks (fixed, broadcast across envs at blend time)
+        self._foot_chain_mask = (
+            np.asarray(foot_chain_mask, dtype=bool) if foot_chain_mask is not None else None
+        )
+        self._hand_chain_mask = (
+            np.asarray(hand_chain_mask, dtype=bool) if hand_chain_mask is not None else None
+        )
         self._out: np.ndarray | None = None
 
     @property
@@ -75,6 +87,9 @@ class GravityCompController(MotorController):
         *,
         full_qpos: np.ndarray | None = None,
         full_qvel: np.ndarray | None = None,
+        # Phase P 三基准GC: per-env weights [w_foot, w_pelvis, w_hand] in [0,1].
+        # When provided, blend g_foot / g_pelvis / g_hand instead of g_pelvis only.
+        gc_weights: np.ndarray | None = None,
         **kwargs,
     ) -> np.ndarray:
         """Compute PD + gravity compensation torques.
@@ -85,6 +100,11 @@ class GravityCompController(MotorController):
             joint_vel: Current joint velocities ``(num_envs, num_actions)``.
             full_qpos: Full MuJoCo qpos ``(num_envs, nq)`` for Pinocchio.
             full_qvel: Full MuJoCo qvel ``(num_envs, nv)`` for Pinocchio.
+            gc_weights: Optional ``(num_envs, 3)`` weights [w_foot, w_pelvis, w_hand]
+                in [0,1]. When given, gravity = w_foot·g_foot + w_pelvis·g_pelvis +
+                w_hand·g_hand, where g_foot adds the torso-rest gravity to leg-chain
+                joints (and g_hand to hand-chain joints). When None, falls back to
+                g_pelvis only (backward-compatible behavior).
 
         Returns:
             Motor torques ``(num_envs, num_actions)``.
@@ -99,7 +119,23 @@ class GravityCompController(MotorController):
 
         # Gravity compensation term: g(q)
         if full_qpos is not None and full_qvel is not None:
-            tau_gravity = self._dynamics_model.gravity(full_qpos, full_qvel)
+            if gc_weights is not None and self._foot_chain_mask is not None:
+                # Phase P 三基准GC: blend g_pelvis / g_foot / g_hand
+                g_pelvis, g_total = self._dynamics_model.gravity_multi_base_with_cache(
+                    full_qpos, full_qvel
+                )
+                # g_foot = g_total - g_pelvis on foot chain; g_pelvis elsewhere.
+                # g_hand = g_total - g_pelvis on hand chain; g_pelvis elsewhere.
+                foot_mask = self._foot_chain_mask  # (nv_act,)
+                hand_mask = self._hand_chain_mask if self._hand_chain_mask is not None else foot_mask
+                g_foot = np.where(foot_mask[None, :], g_total - g_pelvis, g_pelvis)
+                g_hand = np.where(hand_mask[None, :], g_total - g_pelvis, g_pelvis)
+                w_foot = gc_weights[:, 0:1]   # (num_envs,1)
+                w_pelvis = gc_weights[:, 1:2]
+                w_hand = gc_weights[:, 2:3]
+                tau_gravity = w_foot * g_foot + w_pelvis * g_pelvis + w_hand * g_hand
+            else:
+                tau_gravity = self._dynamics_model.gravity(full_qpos, full_qvel)
             if self._gravity_comp_mask is not None:
                 tau_gravity = tau_gravity * self._gravity_comp_mask
             self._out += self._gravity_scale * tau_gravity

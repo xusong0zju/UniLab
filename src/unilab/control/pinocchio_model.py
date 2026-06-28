@@ -45,6 +45,7 @@ class PinocchioDynamicsModel:
 
         # Cached gravity for substep reuse
         self._cached_gravity: np.ndarray | None = None
+        self._cached_gravity_multi: tuple[np.ndarray, np.ndarray] | None = None  # (g_pelvis, g_total)
         self._cache_valid = False
 
         self._build_from_mj_model()
@@ -99,6 +100,9 @@ class PinocchioDynamicsModel:
         # Map: MuJoCo body index → Pinocchio joint id
         # body 0 = world → Pinocchio joint 0 (universe)
         mj_body_to_pin_joint: dict[int, int] = {0: 0}
+        # Phase P 三基准GC: collect (pin_joint_id, axis_local) per hinge joint
+        # to compute g_total geometrically later (avoid isinstance pitfall).
+        _hinge_axes: list[tuple[int, np.ndarray]] = []
 
         for body_id in range(1, mj.nbody):
             parent_body = int(mj.body_parentid[body_id])
@@ -159,6 +163,9 @@ class PinocchioDynamicsModel:
             pin_joint_id = model.addJoint(
                 parent_pin_joint, joint_model, joint_placement, jnt_name
             )
+            # Phase P 三基准GC: record hinge joint axis for g_total computation
+            if jnt_type == MJ_JNT_HINGE:
+                _hinge_axes.append((pin_joint_id, axis.copy()))
 
             # Add body inertia to this joint
             body_mass = float(mj.body_mass[body_id])
@@ -210,6 +217,20 @@ class PinocchioDynamicsModel:
 
         self._model = model
         self._data = model.createData()
+
+        # Phase P 三基准GC: store total mass and per-actuated-joint local axes.
+        # Used by gravity_multi_base() to compute g_total geometrically
+        # (g_pelvis misses the torso on leg joints when the foot is the support).
+        # _hinge_axes collected in build order = Pinocchio joint-id order; the
+        # first hinge is the first actuated nv after the 6-dof floating base.
+        self._total_mass = float(np.sum(np.asarray(mj.body_mass[1:], dtype=np.float64)))
+        # axis_local[j] = local rotation axis of the j-th actuated joint (nv index 6+j)
+        self._actuated_axis_local = (
+            np.stack([ax for _, ax in _hinge_axes], axis=0) if _hinge_axes else np.zeros((0, 3))
+        )
+        self._actuated_pin_joint_ids = (
+            np.array([jid for jid, _ in _hinge_axes], dtype=np.int32) if _hinge_axes else np.zeros(0, dtype=np.int32)
+        )
 
         # Build DOF mapping: Pinocchio nv → MuJoCo nv
         # In Pinocchio with a FreeFlyer, the first 6 nv are the base (vx,vy,vz,wx,wy,wz).
@@ -292,6 +313,73 @@ class PinocchioDynamicsModel:
             gravity[i] = self._data.g[6:].copy()
 
         return gravity
+
+    def gravity_multi_base(
+        self, qpos_batch: np.ndarray, qvel_batch: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Phase P 三基准GC: return (g_pelvis, g_total) for a batch.
+
+        g_pelvis = current RNEA gravity (base=pelvis free-floating). Leg joints
+        only get their own leg's gravity — torso gravity is NOT on the legs.
+
+        g_total = total gravity holding-torque about each actuated joint's axis,
+        from ALL links (base-independent). When the foot is the support, the
+        torso (and rest of robot) hangs off the legs, so the legs must hold the
+        torso: g_foot(joint_on_leg_chain) = g_total - g_pelvis (the torso part).
+
+        g_total(j) = -M_total * (ω_j · cross(p_total - o_j, g_acc))
+          ω_j     = world-frame joint axis (oMi.rotation @ axis_local)
+          o_j     = world-frame joint origin (oMi.translation)
+          p_total = whole-robot COM in world (centerOfMass)
+          g_acc   = [0,0,-9.81]
+
+        Returns: (g_pelvis, g_total), each shape (num_envs, nv_act).
+        """
+        pin_q, _ = self._align_state(qpos_batch, qvel_batch)
+        num_envs = pin_q.shape[0]
+        nv = self._model.nv
+        nv_act = nv - 6
+        g_acc = np.array([0.0, 0.0, -9.81], dtype=np.float64)
+
+        g_pelvis = np.zeros((num_envs, nv_act), dtype=np.float64)
+        g_total = np.zeros((num_envs, nv_act), dtype=np.float64)
+        axis_local = self._actuated_axis_local  # (nv_act, 3)
+        jid = self._actuated_pin_joint_ids  # (nv_act,)
+        M_total = self._total_mass
+
+        for i in range(num_envs):
+            # RNEA gravity (fills data.g and refreshes kinematics data.oMi)
+            pin.computeGeneralizedGravity(self._model, self._data, pin_q[i])
+            g_pelvis[i] = self._data.g[6:].copy()
+            # Whole-robot COM in world frame (refreshes data.com)
+            pin.centerOfMass(self._model, self._data, pin_q[i], True)
+            p_total = self._data.com[0].copy()  # (3,)
+            # Per actuated joint: world axis ω_j and origin o_j
+            # data.oMi[joint_id] is the joint frame placement (world); access per-joint.
+            omega = np.zeros((nv_act, 3), dtype=np.float64)
+            o = np.zeros((nv_act, 3), dtype=np.float64)
+            for k in range(nv_act):
+                T = self._data.oMi[int(jid[k])]
+                omega[k] = T.rotation @ axis_local[k]
+                o[k] = T.translation
+            cross = np.cross(p_total[None, :] - o, g_acc[None, :])  # (nv_act,3)
+            # holding torque = -M_total * (ω · (r × g))
+            g_total[i] = -M_total * np.einsum("ka,ka->k", omega, cross)
+
+        return g_pelvis, g_total
+
+    def gravity_multi_base_with_cache(
+        self, qpos_batch: np.ndarray, qvel_batch: np.ndarray, *, force: bool = False
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Cached version of gravity_multi_base — reuse across substeps within a ctrl_dt.
+
+        g only depends on q (not on the policy's gc_weights), so the cache is
+        valid across substeps. Weight blending happens in the controller.
+        """
+        if force or not self._cache_valid or self._cached_gravity_multi is None:
+            self._cached_gravity_multi = self.gravity_multi_base(qpos_batch, qvel_batch)
+            self._cache_valid = True
+        return self._cached_gravity_multi
 
     def gravity_with_cache(
         self, qpos_batch: np.ndarray, qvel_batch: np.ndarray, *, force: bool = False

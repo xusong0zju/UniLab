@@ -1,14 +1,11 @@
 # @package _global_
-# Phase P: HumanUP轨迹tracking起身 (基于phaseN, 加dof/height tracking reward) reward 课程(无阶段标签, 状态门控).
-# 基于 phaseK(缓存版推倒真倒地起步), 关键改动:
-#   1. 新增 roll_to_supine reward: 鼓励先翻身到仰卧(g向量夹角判据)
-#      状态门控 base_z<0.40 时生效, 站起来后不干扰
-#   2. alive=0: 关白给(phaseL教训: alive让站着划算, 不学翻身)
-#   3. uprightness_exp 1.0→3.0 加强(phaseK教训: 直立度停滞)
-#   4. pushover 80步(20+60+50, phaseL验证不拖慢collector)
-# MoE deep research 确认不引入MoE, 走分阶段reward+Mamba隐式选择
+# Phase Q: 借鉴UHG极简reward + 保留三基准GC(无轨迹).
+# HumanUP轨迹确认是反向挺肚子起身(不能用), 改用UHG式reward(高度+倾斜+平滑).
+# G1大机器人从仰卧到站立跨度大, 加分阶段高度课程(desired_h: 0.35→0.55→0.73).
+# 保留三基准GC(policy输出w_foot/w_pelvis/w_hand + gc_weight_align), 解决腿补偿躯干.
+# 去掉dof/height/orientation tracking(无轨迹).
 # Usage:
-#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseN algo=flashsac
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseQ algo=flashsac
 
 training:
   task_name: G1MultiSkill
@@ -107,28 +104,34 @@ reward:
     pose: -0.1
     penalty_feet_ori: -10.0
     alive: 0.0                    # 关白给(phaseL教训)
-    base_height: -40.0            # Phase P: -30→-40, 加大躺平惩罚(去aux后robot躺平, base低重罚逼起身)
+    base_height: -20.0            # Phase Q: -40→-20, UHG不用重罚躺平
     feet_phase: 0.0
     feet_double_stance: 0.0
     feet_flight: 0.0
     penalty_lifted_foot_contact: 0.0
     penalty_support_foot_contact: 0.0
     com_over_support: 0.0
-    # 翻身阶段 (新增, 核心)
-    roll_to_supine: 4.0           # 翻身到仰卧
-    dof_tracking: 12.0            # Phase P 半蹲修复: 5→12, 关节跟踪成主导(打破半蹲局部最优)
-    height_tracking: 3.0           # Phase P: 跟踪起身高度曲线
-    orientation_tracking: 6.0      # Phase P 半蹲修复: 跟踪轨迹朝向g_x(核心, 打破铅垂半蹲)
-    gc_weight_align: 1.0            # Phase P 三基准GC: 引导policy输出正确支撑权重(w_foot/w_hand对齐接触)
-    # 起身阶段 (复用phaseK)
-    height_exp: 12.0             # Phase P: 8→12, 加大起身动力(去aux后robot躺平不动, 需强拉起身)
-    head_height: 4.0              # Phase P 翘臀修复: 奖励 head 抬起(打破只抬骨盆不抬上身)
-    delta_height: 4.0
-    stand_feet: 5.0
-    uprightness_exp: 6.0          # 保留权重6, 但代码加高度门控(base>0.65才生效, 让位轨迹朝向)
+    # 翻身(保留, 起身前先翻身到仰卧)
+    roll_to_supine: 4.0
+    # Phase Q 借鉴UHG极简reward: 头部高度接近分阶段目标(主)
+    head_height_target: 10.0       # 新: exp(-10*(head_z-desired_h)^2), desired_h分阶段(0.35→0.55→0.73)
+    # 手撑地引导(用户: 没这大概率起不来. 仰卧起身需弯腰同时双手撑地辅助)
+    hand_support: 4.0              # 新: 奖励手腕接近地面(撑地), 门控base<0.5起身阶段
+    # 起身辅助(保留稠密信号)
+    delta_height: 4.0              # 每步上升(稠密)
+    stand_feet: 5.0               # 脚着地终点
+    uprightness_exp: 6.0           # 保留, 代码门控改base>0.4(UHG式, 半跪就奖励直立)
+    # 三基准GC权重对齐(保留, 用户强调不能丢)
+    gc_weight_align: 1.0
     soft_symmetry: -1.0
+    # 去掉trajectory tracking(HumanUP轨迹是反向挺肚子, 不用)
+    # dof_tracking: 0.0  (不注册即0)
+    # height_tracking: 0.0
+    # orientation_tracking: 0.0
+    # height_exp: 0.0
+    # head_height: 0.0
   tracking_sigma: 0.25
-  dof_tracking_sigma: 0.5         # Phase P: 0.8太宽(robot躺平到frame30还拿0.37不罚), 0.5适中(frame0匹配满分12, frame30躺平只0.9逼起身, 早期梯度不消失)
+  dof_tracking_sigma: 0.5
   base_height_target: 0.754
   min_base_height: 0.05           # 放宽(方向B): 防止仰卧秒摔终止, 让robot挣扎学习
   max_tilt_deg: 80.0

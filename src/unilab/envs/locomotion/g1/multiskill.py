@@ -159,6 +159,19 @@ class G1MultiSkillCfg(G1WalkEnvCfg):
     # allow true grounded poses (tilt>60) to not instantly terminate. Other envs
     # still use max_tilt_deg. Default 80 keeps old behavior.
     max_tilt_fallen_deg: float = 80.0
+    # Phase P (方向B): min base height for FALLEN envs before termination.
+    # fallen envs start supine and must be allowed to flounder on the ground
+    # (base_z dips below standing min_base_height during get-up attempts).
+    # Default = -1.0 keeps behavior identical to min_base_height (no separate
+    # fallen floor) — only set lower in phaseP so fallen envs don't terminate
+    # the instant base_z < min_base_height. phaseP sets 0.0 (effectively off,
+    # tilt>170 still terminates). Non-fallen envs always use min_base_height.
+    min_base_height_fallen: float = -1.0
+    # Phase P 翘臀修复: enable MuJoCo body tracking sensors so env can read
+    # arbitrary body world positions via get_body_pos_w (needed for
+    # _reward_head_height on torso_link). Default False keeps phaseI/H/N
+    # behavior (no injected sensors). phaseP sets True.
+    add_body_sensors: bool = False
     pushover_force: float = 50.0       # push magnitude (N) during pushover
     pushover_push_steps: int = 15      # steps applying push force
     pushover_settle_steps: int = 150   # free-fall settle steps
@@ -365,14 +378,25 @@ class MultiSkillDRProvider(G1WalkDomainRandomizationProvider):
         # frame-0 pose (aligned with dof/height tracking from step 0). Overrides
         # pushover/kneeling. Done AFTER legacy fallen logic, BEFORE yaw randomization
         # (yaw would break trajectory orientation alignment).
-        if env._getup_traj_len > 0 and np.any(is_fallen) and not getattr(env.cfg, "fallen_pushover", False):
+        # IMPORTANT: use the ORIGINAL env._is_fallen[env_ids] flag (all fallen envs),
+        # NOT the local `is_fallen` — the kneeling curriculum above mutates the local
+        # is_fallen (removes kneeling envs), so using it here would leave half the
+        # fallen envs in a kneeling/standing pose instead of the trajectory supine
+        # frame-0. This was the "half envs start standing, half supine" root cause.
+        if env._getup_traj_len > 0 and np.any(env._is_fallen[env_ids]) and not getattr(env.cfg, "fallen_pushover", False):
             # Phase P: when NOT using pushover, fallen envs start from trajectory
             # frame-0 (stable supine, quat fixed to back-down). When pushover=true,
             # robot starts from random grounded pose and rolls to supine on its
             # own, then tracking triggers — so skip trajectory override.
-            n_f = int(np.sum(is_fallen))
+            # Re-derive the ORIGINAL fallen mask (kneeling curriculum mutated
+            # the local is_fallen; we need all fallen envs incl. kneeling ones).
+            orig_fallen = env._is_fallen[env_ids]
+            n_f = int(np.sum(orig_fallen))
             traj_qpos = self._trajectory_frame_qpos(env, 0, n_f)  # (n_f, nq)
-            qpos_all[is_fallen] = traj_qpos
+            qpos_all[orig_fallen] = traj_qpos
+            # restore local is_fallen to original so downstream (yaw skip etc.)
+            # treats all fallen envs consistently.
+            is_fallen = orig_fallen.copy()
 
         qvel = np.tile(env._init_qvel, (num_reset, 1))
         qpos_all[:, 0:2] += np.random.uniform(-0.5, 0.5, (num_reset, 2))
@@ -503,6 +527,22 @@ class G1MultiSkillEnv(G1WalkEnv):
     _cfg: G1MultiSkillCfg
     _keyframe_name = "stand"  # default, flamingo envs override at reset
 
+    def _init_action_space(self) -> None:
+        """Phase P 三基准GC: action = [29 joint targets, 3 GC weights in [-1,1]].
+
+        Override locomotion base (which sets action_space to (nu,) = 29 from
+        actuator ctrl_range). We append 3 GC-weight dims bounded [-1,1] so the
+        policy can output w_foot/w_pelvis/w_hand. _num_action stays 29 (joint
+        space) — set in __init__ after super() makes it 32.
+        """
+        import gymnasium as gym
+        ctrl_range = self._backend.get_actuator_ctrl_range()
+        nu = self._backend.num_actuators  # 29
+        low = np.concatenate([ctrl_range[:, 0], np.full(3, -1.0)])
+        high = np.concatenate([ctrl_range[:, 1], np.full(3, 1.0)])
+        self._action_space = gym.spaces.Box(low, high, (nu + 3,), dtype=float)
+        self._num_policy_action = nu + 3  # 32
+
     def __init__(self, cfg: G1MultiSkillCfg, num_envs: int = 1, backend_type: str = "mujoco"):
         if cfg.reward_config is None:
             raise ValueError("reward_config must be provided via Hydra configuration")
@@ -514,10 +554,31 @@ class G1MultiSkillEnv(G1WalkEnv):
             push_body_name=getattr(cfg.domain_rand, "push_body_name", None),
             motrix_max_iterations=cfg.motrix_max_iterations,
             post_step_forward_sensor=cfg.post_step_forward_sensor,
+            add_body_sensors=getattr(cfg, "add_body_sensors", False),
         )
         # Call G1BaseEnv.__init__ directly (skip G1WalkEnv init to set up our own DR)
+        # Phase P 重做: switch MuJoCo position actuators → motor (torque) actuators
+        # BEFORE pool materialization, so we can use GravityCompController (τ=PD+g(q)).
+        # Without gravity comp, pure-PD (kp~28) can't overcome torso gravity in supine
+        # get-up — robot physically couldn't bend its waist (only reached 15% of target),
+        # causing all the "lying flat / can't get up" failures. See G1WalkEnv init
+        # (joystick.py:898-904) for the same pattern.
+        from unilab.control.actuator_switch import switch_to_motor_actuators
+        from unilab.control.pinocchio_model import PinocchioDynamicsModel
+        actuator_info = switch_to_motor_actuators(backend._model)
+        dynamics_model = PinocchioDynamicsModel(backend._model)
+
         from unilab.envs.locomotion.g1.base import G1BaseEnv
         G1BaseEnv.__init__(self, cfg, backend, num_envs)
+        # Phase P 三基准GC: _num_action must stay 29 (joint space). locomotion base
+        # set it to action_space.shape[0]=32 (incl 3 GC weights); restore to 29 so
+        # all joint-space buffers (pose_weights, current_actions, default_angles,
+        # controller kp/kd) remain 29-dim. apply_action splits 32→29+3.
+        self._num_action = self._backend.num_actuators  # 29
+        # default_angles was sliced with the old (32) _num_action — recompute with 29.
+        import numpy as _np_da
+        _dtype = get_global_dtype() if self._use_global_dtype else np.float64
+        self.default_angles = np.asarray(self._init_qpos[-self._num_action:], dtype=_dtype)
 
         self._enable_reward_log = True
         self._reward_cfg = cfg.reward_config
@@ -556,6 +617,9 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._reward_fns["penalty_orientation_adaptive"] = self._reward_orientation_adaptive
         # HumanUP-inspired get-up rewards (Phase G v2)
         self._reward_fns["height_exp"] = self._reward_height_exp
+        self._reward_fns["head_height"] = self._reward_head_height
+        self._reward_fns["head_height_target"] = self._reward_head_height_target  # Phase Q UHG式
+        self._reward_fns["hand_support"] = self._reward_hand_support  # Phase Q 手撑地引导
         self._reward_fns["delta_height"] = self._reward_delta_height
         self._reward_fns["stand_feet"] = self._reward_stand_feet
         self._reward_fns["soft_symmetry"] = self._reward_soft_symmetry
@@ -571,12 +635,67 @@ class G1MultiSkillEnv(G1WalkEnv):
         # Phase P: HumanUP reference trajectory tracking (dof + height)
         self._reward_fns["dof_tracking"] = self._reward_dof_tracking
         self._reward_fns["height_tracking"] = self._reward_height_tracking
+        self._reward_fns["orientation_tracking"] = self._reward_orientation_tracking
+        self._reward_fns["gc_weight_align"] = self._reward_gc_weight_align  # Phase P 三基准GC
         # Running flight phase reward (high-speed airborne, walk/stand envs only)
         self._reward_fns["feet_flight"] = self._reward_feet_flight
         # v3: route alive by command — walk envs (cmd vx != 0) get NO alive bonus,
         # forcing them to earn via tracking instead of standing still. Standing/
         # flamingo/fallen envs (cmd = 0) keep alive to encourage holding still.
         self._reward_fns["alive"] = self._reward_alive
+
+        # Phase P 重做: motor actuator + gravity compensation setup.
+        # Replicates G1WalkEnv's setup (joystick.py:941-977) which multiskill
+        # skipped by not calling G1WalkEnv.__init__. Without this, multiskill used
+        # pure position actuators (no g(q) feedforward), and the low PD kp (~28 for
+        # waist) couldn't overcome torso gravity in supine get-up — robot physically
+        # couldn't bend its waist to follow the trajectory, causing "lying flat".
+        # With motor actuators + GravityCompController: τ = kp(q_d-q) - kd·q̇ + g(q),
+        # the gravity term cancels the torso weight so PD only needs to drive motion.
+        num_actions = self._num_action
+        self._base_motor_kp = actuator_info.kp.copy()
+        self._base_motor_kd = actuator_info.kd.copy()
+        self._motor_kp = np.broadcast_to(self._base_motor_kp, (num_envs, num_actions)).copy()
+        self._motor_kd = np.broadcast_to(self._base_motor_kd, (num_envs, num_actions)).copy()
+        self._force_lower = actuator_info.force_lower.copy()
+        self._force_upper = actuator_info.force_upper.copy()
+
+        gc_config = cfg.control_config
+        gravity_comp_mask = None
+        if getattr(gc_config, "gravity_comp_mask", None) is not None:
+            gravity_comp_mask = np.asarray(gc_config.gravity_comp_mask, dtype=np.float64)
+            if gravity_comp_mask.shape[0] != num_actions:
+                raise ValueError(
+                    f"gravity_comp_mask length ({gravity_comp_mask.shape[0]}) "
+                    f"must match num_actions ({num_actions})"
+                )
+        from unilab.control.gravity_comp_controller import GravityCompController
+        # Phase P 三基准GC: foot chain = both legs (0-11), hand chain = both arms (15-28).
+        # g_foot adds torso-rest gravity to leg joints (foot-support case);
+        # g_hand adds below-hand gravity to arm joints (hand-support case).
+        # Waist (12-14) excluded from hand chain to avoid double-count (v1 simplification).
+        _chain_mask = np.zeros(num_actions, dtype=bool)
+        _foot_mask = _chain_mask.copy(); _foot_mask[0:12] = True   # both legs
+        _hand_mask = _chain_mask.copy(); _hand_mask[15:29] = True  # both arms (excl waist)
+        self._controller = GravityCompController(
+            dynamics_model=dynamics_model,
+            kp=self._base_motor_kp,
+            kd=self._base_motor_kd,
+            force_lower=self._force_lower,
+            force_upper=self._force_upper,
+            gravity_comp_mask=gravity_comp_mask,
+            gravity_scale=getattr(gc_config, "gravity_scale", 1.0),
+            foot_chain_mask=_foot_mask,
+            hand_chain_mask=_hand_mask,
+        )
+        self._dynamics_model = dynamics_model
+        self._last_motor_ctrl = np.zeros((num_envs, num_actions), dtype=get_global_dtype())
+        # Phase P 三基准GC: per-env GC weights [w_foot, w_pelvis, w_hand], default
+        # all-pelvis (current behavior until policy learns to use them).
+        self._gc_weights = np.tile(np.array([0.0, 1.0, 0.0], dtype=get_global_dtype()), (num_envs, 1))
+        # Register pre_step_control callback so backend converts target positions
+        # (from apply_action) → motor torques (τ=PD+g(q)) before each physics step.
+        self._backend.set_pre_step_control(self._pre_step_motor_control)
 
         # Pre-compute both keyframes
         stand_qpos = backend.get_keyframe_qpos("stand")
@@ -592,6 +711,7 @@ class G1MultiSkillEnv(G1WalkEnv):
         self._getup_traj_dof = None
         self._getup_traj_height = None
         self._getup_traj_len = 0
+        self._getup_traj_base_z = None  # per-frame base_z (head_height mapped), for adaptive frame advance
         traj_file = str(getattr(cfg, "getup_traj_file", ""))
         if traj_file:
             import numpy as _np_traj
@@ -599,7 +719,29 @@ class G1MultiSkillEnv(G1WalkEnv):
             self._getup_traj_dof = _np_traj.asarray(_td["dof_pos"], dtype=get_global_dtype())  # (T,29)
             self._getup_traj_height = _np_traj.asarray(_td["head_height"], dtype=get_global_dtype()).flatten()  # (T,)
             self._getup_traj_len = self._getup_traj_dof.shape[0]
-            print(f"[Phase P] loaded getup traj: {self._getup_traj_len} frames, dof{self._getup_traj_dof.shape}")
+            # head_height -> base_z (same mapping as _reward_height_tracking /
+            # _trajectory_frame_qpos): supine head 0.054 -> base 0.12,
+            # standing head 1.278 -> base 0.754. Ascending with frame.
+            hh = self._getup_traj_height
+            self._getup_traj_base_z = (0.12 + (0.754 - 0.12) * (hh - 0.054) / (1.278 - 0.054)).astype(get_global_dtype())
+            # Phase P 半蹲修复: precompute per-frame expected body orientation g_x
+            # (for _reward_orientation_tracking). tilt=90*(1.278-h)/(1.278-0.054),
+            # g_x = -sin(tilt). frame0 g_x=-1 (supine), frame57 g_x=0 (standing),
+            # monotonic in between (trajectory never flips to prone side g_x>0).
+            _tilt = np.clip(90.0 * (1.278 - hh) / (1.278 - 0.054), 0.0, 90.0)
+            self._getup_traj_ref_gx = (-np.sin(np.deg2rad(_tilt))).astype(get_global_dtype())
+            print(f"[Phase P] loaded getup traj: {self._getup_traj_len} frames, dof{self._getup_traj_dof.shape}, base_z[{self._getup_traj_base_z[0]:.3f}->{self._getup_traj_base_z[-1]:.3f}], ref_gx[{self._getup_traj_ref_gx[0]:.3f}->{self._getup_traj_ref_gx[-1]:.3f}]")
+
+        # Phase P 翘臀修复: cache torso_link body id for _reward_head_height
+        # (the "head/upper body" reward). g1.xml has no separate head body —
+        # torso_link is the topmost torso body (head/cam integrated into it).
+        # Breaks the "bridge" local optimum (legs lift pelvis but torso stays on
+        # ground) by rewarding torso rise via SimBackend.get_body_pos_w.
+        # torso_z: standing ~0.80, supine/bridge ~0.12.
+        self._head_body_id = np.array([self._backend.get_body_id("torso_link")], dtype=np.int32)
+        # Phase P 三基准GC: wrist body ids for gc_weight_align hand-contact heuristic
+        self._left_wrist_id = np.array([self._backend.get_body_id("left_wrist_roll_link")], dtype=np.int32)
+        self._right_wrist_id = np.array([self._backend.get_body_id("right_wrist_roll_link")], dtype=np.int32)
 
         base_kp, base_kd = None, None
         if cfg.domain_rand.randomize_kp or cfg.domain_rand.randomize_kd:
@@ -635,6 +777,14 @@ class G1MultiSkillEnv(G1WalkEnv):
         # Triggered when g_body·[-1,0,0] > 0.5 (reached supine). Reuses phaseN
         # rollover ability — robot rolls to supine on its own, THEN tracking starts.
         self._tracking_frame: np.ndarray = np.full(self._num_envs, -1, dtype=np.int32)
+        # Phase P 重做: per-env step counter for TIME-FORCED frame advance.
+        # Replaces adaptive (base_z-anchored) advance which formed a self-consistent
+        # loop (robot tracks frame-15 well → frame doesn't advance → base doesn't
+        # rise → stays at frame-15). Time-forced advance (every FRAME_ADVANCE_PERIOD
+        # steps +1 frame) forces the robot to follow the FULL trajectory sequence
+        # (curl-up → hip-back → reach-arms → stand), not dwell on a comfortable frame.
+        # -1 = not triggered yet; 0+ counts steps since supine trigger.
+        self._tracking_step_count: np.ndarray = np.full(self._num_envs, -1, dtype=np.int32)
         self._init_domain_randomization(dr_provider)
 
         self._last_push_force: np.ndarray = np.zeros(3, dtype=np.float64)
@@ -688,6 +838,54 @@ class G1MultiSkillEnv(G1WalkEnv):
         h = self._backend.get_base_pos()[:, 2]
         return np.asarray(np.exp(np.clip(h, 0.05, 0.8)) - 1.0, dtype=get_global_dtype()) * self._fallen_mask()
 
+    def _reward_head_height(self, ctx: RewardContext) -> np.ndarray:
+        """Phase P 翘臀修复: reward upper-body (torso) rise to break the bridge
+        local optimum.
+
+        Without this, the policy learns to lift only the pelvis with the legs
+        (satisfying height_exp/base_height/stand_feet) while the torso/head
+        stays on the ground — a "bridge"/hip-thrust pose that scores high on
+        pelvis-based rewards but never actually stands up.
+
+        Uses torso_link (g1.xml has no separate head body; torso is the topmost
+        torso body). torso_z: standing ~0.80, supine/bridge ~0.12. exp(h)-1 form
+        (every cm counts, same shape as height_exp but on the torso). Masked to
+        fallen envs. Uses SimBackend.get_body_pos_w (declared interface, not a
+        backend-private field). Variable named _head_body_id for intent; holds
+        torso_link id.
+        """
+        head_z = self._backend.get_body_pos_w(self._head_body_id)[:, 0, 2]
+        return np.asarray(np.exp(np.clip(head_z, 0.1, 0.8)) - 1.0, dtype=get_global_dtype()) * self._fallen_mask()
+
+    def _reward_head_height_target(self, ctx: RewardContext) -> np.ndarray:
+        """Phase Q 借鉴UHG: reward head_z approaching a STAGED desired height.
+
+        UHG uses exp(-10*(head_h - desired_height)^2) with desired=standing height.
+        But G1 is large (standing head_z~0.73, supine ~0.12); a single target from
+        supine is too sparse — the robot can't explore the stand-up motion. So we
+        STAGE desired_h to ramp up as training progresses (by global step_counter):
+          step < 1.5M (iter~400):  desired_h=0.35 (half-kneel, easy to reach)
+          step < 3.0M (iter~800):  desired_h=0.55 (half-stand)
+          step >= 3.0M:            desired_h=0.73 (standing)
+        Each stage is reachable, pulling the robot up incrementally. Uses torso_link
+        z (same as _reward_head_height). Masked to fallen envs.
+
+        NOTE: step_counter is global cumulative (not per-episode), so all envs share
+        the same stage at a given training step — correct for a curriculum.
+        """
+        head_z = self._backend.get_body_pos_w(self._head_body_id)[:, 0, 2]
+        sc = self.step_counter
+        if sc < 1_500_000:
+            desired_h = 0.35
+        elif sc < 3_000_000:
+            desired_h = 0.55
+        else:
+            desired_h = 0.73
+        err = head_z - desired_h
+        # coef 10→50: 之前太宽(躺平head0.07拿4.6/10=46%, critic学到躺平Q高0.86>起身0.838,
+        # actor跟critic躺平). coef=50让躺平只拿0.2, 起身拿10, 强逼起身(Q诊断确认).
+        return np.asarray(np.exp(-50.0 * np.square(err)), dtype=get_global_dtype()) * self._fallen_mask()
+
     def _reward_delta_height(self, ctx: RewardContext) -> np.ndarray:
         """Reward ANY upward movement: +1 when height increases between steps.
 
@@ -728,11 +926,25 @@ class G1MultiSkillEnv(G1WalkEnv):
 
         Masked to fallen envs — a get-up bonus. Standing/walking envs are kept
         upright by the general penalty_orientation term instead.
+
+        Phase P 半蹲修复: when a getup trajectory is loaded, gate this reward
+        to base_z > 0.65 (near-standing). The trajectory's get-up arc requires
+        the body to TILT mid-rise (frame 15 wants g_x=-0.67, a 47° lean), so
+        rewarding verticality mid-rise conflicts with orientation_tracking and
+        lets the policy farm a vertical half-squat. Near the top (base>0.65)
+        the trajectory is ~vertical anyway, so uprightness safely takes over
+        to pin the final stand. No trajectory → gate=1 (phaseI/H/N unchanged).
         """
         g = ctx.gravity
         assert g is not None
         g_xy_sq = np.square(g[:, 0]) + np.square(g[:, 1])
-        return np.asarray(np.exp(-g_xy_sq), dtype=get_global_dtype()) * self._fallen_mask()
+        upright = np.exp(-g_xy_sq)
+        if self._getup_traj_len > 0:
+            h = self._backend.get_base_pos()[:, 2]
+            # Phase Q: gate 0.65→0.4 (UHG式, 半跪就奖励直立, 配合分阶段高度课程)
+            gate = (h > 0.4).astype(get_global_dtype())
+            upright = upright * gate
+        return np.asarray(upright, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_mid_height(self, ctx: RewardContext) -> np.ndarray:
         """Phase L: reward the half-kneel intermediate height (base_z ~0.42m).
@@ -768,14 +980,29 @@ class G1MultiSkillEnv(G1WalkEnv):
         supine_score = np.exp(-np.square((1.0 - cos_angle) / 0.40))
         h = self._backend.get_base_pos()[:, 2]
         ground_gate = (h < 0.40).astype(get_global_dtype())
-        return np.asarray(supine_score * ground_gate, dtype=get_global_dtype()) * self._fallen_mask()
+        # Phase P 方向B: gate off once supine is reached (tracking started).
+        # With relaxed termination, robot could otherwise farm roll reward by
+        # lying supine indefinitely. Once _tracking_frame>=0 (supine reached),
+        # tracking rewards take over; roll reward only pays for the GETTING-
+        # supine process (not staying supine). No-op when no getup traj.
+        rolling = np.ones_like(supine_score, dtype=get_global_dtype())
+        if self._getup_traj_len > 0:
+            rolling = (self._tracking_frame < 0).astype(get_global_dtype())
+        return np.asarray(supine_score * ground_gate * rolling, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_dof_tracking(self, ctx: RewardContext) -> np.ndarray:
         """Phase P: track HumanUP get-up trajectory joint angles.
 
         Frame = per-env _tracking_frame (supine-triggered: -1 while rolling,
         0+ after reaching supine). Returns 0 for envs not yet supine (still
-        rolling over via phaseN ability). Masked to fallen envs."""
+        rolling over via phaseN ability). Masked to fallen envs.
+
+        Uses MEAN per-joint squared error (err / n_joints) so that sigma has a
+        per-joint physical meaning (rad). With sum-MSE, sigma had to absorb the
+        29-joint scale and early-exploration errors (~11) drove exp to ~0
+        regardless of sigma. mean-MSE makes exp(-mse/sigma^2) responsive: sigma=0.5
+        ≈ 28° per-joint tolerance, 1.0 ≈ 57°. Early exploration still scores >0
+        so the gradient can pull joints toward the reference."""
         if self._getup_traj_len == 0:
             return np.zeros(ctx.num_envs, dtype=get_global_dtype())
         frames = np.clip(self._tracking_frame, 0, self._getup_traj_len - 1)
@@ -783,9 +1010,9 @@ class G1MultiSkillEnv(G1WalkEnv):
         ref_dof = self._getup_traj_dof[frames]  # (N, 29)
         cur_dof = ctx.dof_pos
         n = min(ref_dof.shape[1], cur_dof.shape[1])
-        err = np.sum(np.square(cur_dof[:, :n] - ref_dof[:, :n]), axis=1)
+        mse = np.sum(np.square(cur_dof[:, :n] - ref_dof[:, :n]), axis=1) / float(n)
         sigma = float(getattr(self._reward_cfg, "dof_tracking_sigma", 1.5))
-        return np.asarray(np.exp(-err / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
+        return np.asarray(np.exp(-mse / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
 
     def _reward_height_tracking(self, ctx: RewardContext) -> np.ndarray:
         """Phase P: track HumanUP get-up trajectory head/base height.
@@ -800,6 +1027,88 @@ class G1MultiSkillEnv(G1WalkEnv):
         err = np.square(cur_z - ref_base_z)
         sigma = float(getattr(self._reward_cfg, "height_tracking_sigma", 0.15))
         return np.asarray(np.exp(-err / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
+
+    def _reward_orientation_tracking(self, ctx: RewardContext) -> np.ndarray:
+        """Phase P 半蹲修复: track trajectory frame's expected body orientation (g_x).
+
+        Without this, the policy farms uprightness (keeps body vertical) at a
+        half-squat base_z~0.46 instead of tilting per the trajectory's get-up
+        arc (frame 15 wants g_x=-0.67, a 47° tilt). The adaptive frame index is
+        anchored by base_z, so a robot at the right height but wrong orientation
+        gets stuck mid-trajectory with dof_tracking~0.1 (joints don't match).
+
+        Trajectory g_x is precomputed per frame (_getup_traj_ref_gx): frame 0
+        g_x=-1 (supine), frame 57 g_x=0 (standing), monotonic, never flips to
+        the prone side (g_x>0). Rewarding alignment to this forces the robot to
+        follow the trajectory's tilt arc, not just its height.
+
+        Supine-triggered (0 while rolling). sigma=0.3 (~17° tolerance). Masked
+        to fallen envs. Uses ctx.gravity (same source as roll_to_supine)."""
+        if self._getup_traj_len == 0:
+            return np.zeros(ctx.num_envs, dtype=get_global_dtype())
+        frames = np.clip(self._tracking_frame, 0, self._getup_traj_len - 1)
+        active = (self._tracking_frame >= 0).astype(get_global_dtype())
+        ref_gx = self._getup_traj_ref_gx[frames]  # (N,) expected g_x per frame
+        cur_gx = ctx.gravity[:, 0]
+        err = np.square(cur_gx - ref_gx)
+        sigma = 0.3
+        return np.asarray(np.exp(-err / (sigma * sigma)), dtype=get_global_dtype()) * active * self._fallen_mask()
+
+    def _reward_gc_weight_align(self, ctx: RewardContext) -> np.ndarray:
+        """Phase P 三基准GC: align policy GC weights to actual contact state.
+
+        The 3 GC weights (w_foot, w_pelvis, w_hand) only weakly affect reward
+        through dynamics, so pure RL tends to collapse them. This auxiliary
+        reward shapes them toward the contact-grounded target:
+          c_foot = fraction of feet in contact (0 / 0.5 / 1)
+          c_hand = fraction of hands in contact (0 / 0.5 / 1) — v1 uses wrist-z heuristic
+        Penalizes |w_foot - c_foot| + |w_hand - c_hand| so the policy learns to
+        declare the correct support basis (foot when feet down, hand when hands down).
+        Masked to fallen envs (get-up only). Small weight (configurable).
+        """
+        if not hasattr(self, "_gc_weights") or self._gc_weights is None:
+            return np.zeros(ctx.num_envs, dtype=get_global_dtype())
+        w_foot = self._gc_weights[:, 0]
+        w_hand = self._gc_weights[:, 2]
+        # Foot contact fraction (0/0.5/1)
+        lc = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        rc = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        c_foot = (lc.astype(get_global_dtype()) + rc.astype(get_global_dtype())) * 0.5
+        # Hand contact: v1 heuristic — wrist-link z < 0.10 (near ground)
+        # (no hand contact sensors; wrist height is a reasonable proxy during get-up)
+        lw = self._backend.get_body_pos_w(self._left_wrist_id)[:, 0, 2]
+        rw = self._backend.get_body_pos_w(self._right_wrist_id)[:, 0, 2]
+        c_hand = ((lw < 0.10).astype(get_global_dtype()) + (rw < 0.10).astype(get_global_dtype())) * 0.5
+        lam = float(getattr(self._reward_cfg, "gc_weight_align_lambda", 0.05))
+        penalty = np.abs(w_foot - c_foot) + np.abs(w_hand - c_hand)
+        return np.asarray(-lam * penalty, dtype=get_global_dtype()) * self._fallen_mask()
+
+    def _reward_hand_support(self, ctx: RewardContext) -> np.ndarray:
+        """Phase Q: hands reach ground during get-up, then lift when standing.
+
+        Two-phase shaping to avoid the "hands stuck on ground" failure:
+          - base_z < 0.5 (get-up phase): REWARD wrists low (~0.05m) — the
+            "弯腰同时双手撑地" lever that's physically needed to rise from supine.
+          - base_z >= 0.5 (near standing): PENALIZE wrists low — once the legs
+            carry the body, hands must come UP, not stay planted. Without this,
+            the policy can farm hand_support by keeping hands down while standing
+            (wrong, unstable stance).
+
+        Reward(low phase) = +exp(-(wrist_z-0.05)^2/σ^2);  Penalty(high phase)
+        = -exp(-(wrist_z-0.05)^2/σ^2) * (wrist actually low). Per wrist, mean.
+        Masked to fallen envs. σ=0.10.
+        """
+        lw = self._backend.get_body_pos_w(self._left_wrist_id)[:, 0, 2]
+        rw = self._backend.get_body_pos_w(self._right_wrist_id)[:, 0, 2]
+        sigma = 0.10
+        low_score = (np.exp(-np.square((lw - 0.05) / sigma)) +
+                     np.exp(-np.square((rw - 0.05) / sigma))) * 0.5  # 0..1
+        h = self._backend.get_base_pos()[:, 2]
+        # get-up phase (base<0.5): reward hands down; standing phase (base>=0.5): penalize hands down
+        getup = (h < 0.5).astype(get_global_dtype())
+        standing = (h >= 0.5).astype(get_global_dtype())
+        r = low_score * getup - low_score * standing
+        return np.asarray(r, dtype=get_global_dtype()) * self._fallen_mask()
 
     def _reward_orientation_adaptive(self, ctx: RewardContext) -> np.ndarray:
         """Orientation penalty scaled by height — gentle when near ground (getting up).
@@ -950,6 +1259,11 @@ class G1MultiSkillEnv(G1WalkEnv):
     def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
         """Override base apply_action to advance gait_phase each step.
 
+        Phase P 三基准GC: action is 32-dim = [29 joint targets, 3 GC weights].
+        Split joint targets (→ ctrl) from GC weights (w_foot/w_pelvis/w_hand in
+        [-1,1] → [0,1]). current_actions stores only the 29 joint part so the obs
+        "actions" group (29, per obs_groups_spec) stays consistent.
+
         The inherited LocomotionBaseEnv.apply_action only stores last/current
         actions and builds ctrl — it never advances gait_phase, so the phase
         sampled at reset stays static for the whole episode. With a static
@@ -957,21 +1271,57 @@ class G1MultiSkillEnv(G1WalkEnv):
         lift instead of an alternating gait. Advance both legs phases here so
         walking envs track a moving phase target (alternating stance/swing).
         """
-        state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
-        state.info["current_actions"] = actions
-        exec_actions = (
-            state.info["last_actions"]
-            if self._cfg.control_config.simulate_action_latency
-            else actions
-        )
+        # Phase P 三基准GC: split 32-dim action into 29 joints + 3 weights.
+        joint_actions = actions[:, : self._num_action]  # (N, 29)
+        weight_actions = actions[:, self._num_action : self._num_action + 3]  # (N, 3) in [-1,1]
+        # latency applies to BOTH parts consistently (use joint part's last_actions shape)
+        prev_joint = state.info.get("current_actions", np.zeros_like(joint_actions))
+        state.info["last_actions"] = prev_joint
+        state.info["current_actions"] = joint_actions  # obs "actions" group = 29-dim
+        if self._cfg.control_config.simulate_action_latency:
+            exec_joint = prev_joint
+            # weights: also lag (store separately is complex; use current for simplicity)
+            exec_weights = weight_actions
+        else:
+            exec_joint = joint_actions
+            exec_weights = weight_actions
+        # GC weights in [0,1]: w_foot, w_pelvis, w_hand
+        self._gc_weights = ((exec_weights + 1.0) * 0.5).astype(get_global_dtype())
         gait_phase = state.info.get(
             "gait_phase", np.zeros((self._num_envs, 2), dtype=get_global_dtype())
         )
         gait_phase[:, 0] = (gait_phase[:, 0] + self._gait_phase_delta) % (2 * np.pi)
         gait_phase[:, 1] = (gait_phase[:, 1] + self._gait_phase_delta) % (2 * np.pi)
         state.info["gait_phase"] = gait_phase
-        ctrl: np.ndarray = exec_actions * self._cfg.control_config.action_scale + self.default_angles
+        ctrl: np.ndarray = exec_joint * self._cfg.control_config.action_scale + self.default_angles
         return ctrl
+
+    def _pre_step_motor_control(self, backend: Any, policy_ctrl: np.ndarray) -> np.ndarray:
+        """Pre-step callback: convert target positions → motor torques with gravity comp.
+
+        Replicates G1WalkEnv._pre_step_motor_control (joystick.py:1060). Called by
+        the backend before each physics substep. Gravity computed once per ctrl_dt
+        and cached across substeps.
+        """
+        self._dynamics_model.invalidate_cache()
+        joint_pos = backend.get_dof_pos()
+        joint_vel = backend.get_dof_vel()
+        full_qpos = backend.get_full_qpos()
+        full_qvel = backend.get_full_qvel()
+        # Update controller gains (may have been randomized by DR at reset)
+        self._controller.kp = self._motor_kp
+        self._controller.kd = self._motor_kd
+        # τ = kp(q_d - q) - kd·q̇ + (w_foot·g_foot + w_pelvis·g_pelvis + w_hand·g_hand)
+        motor_ctrl = self._controller.compute(
+            policy_ctrl,
+            joint_pos,
+            joint_vel,
+            full_qpos=full_qpos,
+            full_qvel=full_qvel,
+            gc_weights=self._gc_weights,  # Phase P 三基准GC: per-env [w_foot,w_pelvis,w_hand]
+        )
+        self._last_motor_ctrl = motor_ctrl
+        return motor_ctrl
 
     # ── Phase K: pushover get-up reset ───────────────────────────────
     def reset(self, env_indices: np.ndarray):
@@ -982,6 +1332,7 @@ class G1MultiSkillEnv(G1WalkEnv):
         obs, info = super().reset(env_indices)
         # Phase P: reset tracking frame to -1 (not yet supine, must roll over first)
         self._tracking_frame[env_indices] = -1
+        self._tracking_step_count[env_indices] = -1  # Phase P 重做: reset step counter too
         if getattr(self._cfg, "fallen_pushover", False):
             self._fallen_pushover_warmup(env_indices)
             obs = self._recompute_reset_obs(env_indices, info)
@@ -1186,11 +1537,25 @@ class G1MultiSkillEnv(G1WalkEnv):
             reached_supine = cos_supine > 0.5
             newly_triggered = not_triggered & reached_supine
             self._tracking_frame[newly_triggered] = 0
-            # increment already-tracking envs (cap at traj_len-1, hold last frame)
+            self._tracking_step_count[newly_triggered] = 0  # start counting on trigger
+            # Phase P 重做: TIME-FORCED frame advance (replaces adaptive base_z-anchored).
+            # Adaptive advance formed a self-consistent loop: robot tracks frame-15
+            # well → base_z stays ~0.46 → frame re-anchors to 15 → robot dwells there
+            # forever (never rises). Time-forced advance pushes frame forward every
+            # FRAME_ADVANCE_PERIOD steps regardless of robot state, forcing the robot
+            # to follow the FULL trajectory sequence (curl-up → hip-back → reach-arms
+            # → stand) or fall behind and lose dof_tracking/orientation_tracking reward.
+            # Rate: every 5 steps +1 frame → 58*5=290 steps = 5.8s to stand (joint
+            # speed demand 6.4 rad/s, within G1's ~10 rad/s limit). At end, hold last frame.
+            FRAME_ADVANCE_PERIOD = 5
             tracking = self._tracking_frame >= 0
-            self._tracking_frame[tracking] = np.minimum(
-                self._tracking_frame[tracking] + 1, self._getup_traj_len - 1
-            )
+            if np.any(tracking):
+                self._tracking_step_count[tracking] += 1
+                new_frame = np.minimum(
+                    self._tracking_step_count[tracking] // FRAME_ADVANCE_PERIOD,
+                    self._getup_traj_len - 1,
+                )
+                self._tracking_frame[tracking] = new_frame.astype(np.int32)
 
         # HoST-inspired assistive upward force: helps robot discover get-up.
         # Goes through the SimBackend.apply_body_force interface (world-frame,
@@ -1237,11 +1602,18 @@ class G1MultiSkillEnv(G1WalkEnv):
         if max_tilt_fallen > self._reward_cfg.max_tilt_deg and np.any(self._is_fallen):
             grav = self._backend.get_sensor_data(self._cfg.sensor.upvector)
             tilt = np.arccos(np.clip(grav[:, 2], -1, 1))
+            # Phase P 方向B: fallen envs use a separate (lower) base-height floor
+            # so they can flounder on the ground after falling without instant
+            # termination. min_base_height_fallen<0 falls back to min_base_height
+            # (preserves phaseK/J behavior).
+            min_h_fallen = float(getattr(self._cfg, "min_base_height_fallen", -1.0))
+            if min_h_fallen < 0.0:
+                min_h_fallen = self._reward_cfg.min_base_height
             fallen_strict = (tilt > np.deg2rad(self._reward_cfg.max_tilt_deg)) | (
                 self._terrain_relative_base_height() < self._reward_cfg.min_base_height
             )
             fallen_relaxed = (tilt > np.deg2rad(max_tilt_fallen)) | (
-                self._terrain_relative_base_height() < self._reward_cfg.min_base_height
+                self._terrain_relative_base_height() < min_h_fallen
             )
             # fallen envs use relaxed threshold; non-fallen keep strict
             new_term = np.where(self._is_fallen, fallen_relaxed, fallen_strict)

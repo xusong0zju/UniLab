@@ -1,14 +1,11 @@
 # @package _global_
-# Phase P: HumanUP轨迹tracking起身 (基于phaseN, 加dof/height tracking reward) reward 课程(无阶段标签, 状态门控).
-# 基于 phaseK(缓存版推倒真倒地起步), 关键改动:
-#   1. 新增 roll_to_supine reward: 鼓励先翻身到仰卧(g向量夹角判据)
-#      状态门控 base_z<0.40 时生效, 站起来后不干扰
-#   2. alive=0: 关白给(phaseL教训: alive让站着划算, 不学翻身)
-#   3. uprightness_exp 1.0→3.0 加强(phaseK教训: 直立度停滞)
-#   4. pushover 80步(20+60+50, phaseL验证不拖慢collector)
-# MoE deep research 确认不引入MoE, 走分阶段reward+Mamba隐式选择
+# Phase R: phaseQ基础上调reward正偏(解决reward负偏-40淹没起身信号).
+# 诊断: phaseQ reward_normalizer rms.mean=-40(主要base_height -20重罚躺平+orientation -10),
+# 起身正向信号(head_height_target +10)被淹没, critic Q负偏, actor没学到起身.
+# 修复: 去掉大负惩罚(base_height -20→0, orientation -10→-2), 让起身拿正分躺平≈0.
+# 保留: 三基准GC + hand_support两阶段 + head_height_target分阶段 + UHG式简化reward.
 # Usage:
-#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseN algo=flashsac
+#   uv run scripts/train_offpolicy.py task=flashsac/g1_multiskill/mamba_phaseR algo=flashsac
 
 training:
   task_name: G1MultiSkill
@@ -29,7 +26,7 @@ algo:
     critic_num_blocks: 3
     normalize_reward: true
     normalized_g_max: 5.0
-    actor_noise_zeta_mu: 2.0
+    actor_noise_zeta_mu: 3.0          # Phase R: 2→3 降探索噪声(让探索更接近mean, 确定性policy更可能固化起身)
     actor_noise_zeta_max: 16
     critic_min_v: -5.0
     critic_max_v: 5.0
@@ -97,38 +94,38 @@ env:
 
 reward:
   scales:
-    # 通用
+    # 通用(Phase R: 降权负惩罚, 避免reward负偏-40淹没起身正向信号)
     tracking_lin_vel: 0.0
     tracking_ang_vel: 0.0
     penalty_ang_vel_xy: -1.0
-    penalty_orientation: -10.0
-    penalty_orientation_adaptive: -5.0
+    penalty_orientation: -2.0          # -10→-2(平躺不该重罚, 靠head_height_target正向拉)
+    penalty_orientation_adaptive: -1.0  # -5→-1
     penalty_action_rate: -2.0
     pose: -0.1
-    penalty_feet_ori: -10.0
-    alive: 0.0                    # 关白给(phaseL教训)
-    base_height: -40.0            # Phase P: -30→-40, 加大躺平惩罚(去aux后robot躺平, base低重罚逼起身)
+    penalty_feet_ori: -2.0             # -10→-2
+    alive: 0.0
+    base_height: 0.0                   # -20→0 去掉重罚躺平(关键: 之前rms.mean=-40主要来自这)
     feet_phase: 0.0
     feet_double_stance: 0.0
     feet_flight: 0.0
     penalty_lifted_foot_contact: 0.0
     penalty_support_foot_contact: 0.0
     com_over_support: 0.0
-    # 翻身阶段 (新增, 核心)
-    roll_to_supine: 4.0           # 翻身到仰卧
-    dof_tracking: 12.0            # Phase P 半蹲修复: 5→12, 关节跟踪成主导(打破半蹲局部最优)
-    height_tracking: 3.0           # Phase P: 跟踪起身高度曲线
-    orientation_tracking: 6.0      # Phase P 半蹲修复: 跟踪轨迹朝向g_x(核心, 打破铅垂半蹲)
-    gc_weight_align: 1.0            # Phase P 三基准GC: 引导policy输出正确支撑权重(w_foot/w_hand对齐接触)
-    # 起身阶段 (复用phaseK)
-    height_exp: 12.0             # Phase P: 8→12, 加大起身动力(去aux后robot躺平不动, 需强拉起身)
-    head_height: 4.0              # Phase P 翘臀修复: 奖励 head 抬起(打破只抬骨盆不抬上身)
+    # 翻身(保留, 起身前先翻身到仰卧)
+    roll_to_supine: 4.0
+    # Phase R 主正向reward: 头部高度接近分阶段目标(让起身拿正分, 躺平≈0)
+    head_height_target: 10.0
+    # 手撑地两阶段(起身奖励撑地, 站立惩罚手低防粘地)
+    hand_support: 4.0
+    # 起身辅助(正向)
     delta_height: 4.0
     stand_feet: 5.0
-    uprightness_exp: 6.0          # 保留权重6, 但代码加高度门控(base>0.65才生效, 让位轨迹朝向)
+    uprightness_exp: 6.0
+    # 三基准GC权重对齐(保留)
+    gc_weight_align: 1.0
     soft_symmetry: -1.0
   tracking_sigma: 0.25
-  dof_tracking_sigma: 0.5         # Phase P: 0.8太宽(robot躺平到frame30还拿0.37不罚), 0.5适中(frame0匹配满分12, frame30躺平只0.9逼起身, 早期梯度不消失)
+  dof_tracking_sigma: 0.5
   base_height_target: 0.754
   min_base_height: 0.05           # 放宽(方向B): 防止仰卧秒摔终止, 让robot挣扎学习
   max_tilt_deg: 80.0
