@@ -35,10 +35,15 @@ class PinocchioDynamicsModel:
         gravity = dynamics.gravity(qpos_batch, qvel_batch)  # (num_envs, nv_actuated)
     """
 
-    def __init__(self, mj_model: Any) -> None:
+    def __init__(self, mj_model: Any, use_conjugate_quat: bool = False) -> None:
         self._mj_model = mj_model
         self._model: pin.Model | None = None
         self._data: pin.Data | None = None
+        # 2026-06-29: MuJoCo qpos quaternion = R_body→world, but Pinocchio
+        # JointModelFreeFlyer expects R_world→body = conj(q_mj).
+        # Set True for getup/fallen tasks (non-stand orientations).
+        # Default False for backward compat with walk envs (near stand).
+        self._use_conjugate_quat = use_conjugate_quat
 
         # Mapping tables
         self._pin_to_mj_dof: np.ndarray | None = None  # Pinocchio nv → MuJoCo nv
@@ -271,10 +276,19 @@ class PinocchioDynamicsModel:
         # Base position (same in both)
         pin_q[:, 0:3] = qpos_batch[:, 0:3]
         # Base quaternion: MuJoCo (w,x,y,z) → Pinocchio (x,y,z,w)
-        pin_q[:, 3] = qpos_batch[:, 4]  # qx
-        pin_q[:, 4] = qpos_batch[:, 5]  # qy
-        pin_q[:, 5] = qpos_batch[:, 6]  # qz
-        pin_q[:, 6] = qpos_batch[:, 3]  # qw
+        # MuJoCo stores R_body→world; Pinocchio JointModelFreeFlyer expects R_world→body.
+        # R_world→body = (R_body→world)⁻¹ = conj(q_mj) → [-x, -y, -z, +w].
+        # For backward compat (walk envs near stand), this is opt-in via use_conjugate_quat.
+        if self._use_conjugate_quat:
+            pin_q[:, 3] = -qpos_batch[:, 4]  # -qx
+            pin_q[:, 4] = -qpos_batch[:, 5]  # -qy
+            pin_q[:, 5] = -qpos_batch[:, 6]  # -qz
+            pin_q[:, 6] = qpos_batch[:, 3]   # +qw
+        else:
+            pin_q[:, 3] = qpos_batch[:, 4]  # qx
+            pin_q[:, 4] = qpos_batch[:, 5]  # qy
+            pin_q[:, 5] = qpos_batch[:, 6]  # qz
+            pin_q[:, 6] = qpos_batch[:, 3]  # qw
 
         # Joint positions (same in both)
         if nq > 7:

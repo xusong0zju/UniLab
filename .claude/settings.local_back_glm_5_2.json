@@ -2,12 +2,12 @@
   "env": {
         "ANTHROPIC_AUTH_TOKEN": "c1b2ae52-e551-4400-9eac-1f6b325fb86d",
         "ANTHROPIC_BASE_URL": "https://kspmas.ksyun.com/v1/chat/completions",
-        "ANTHROPIC_MODEL": "deepseek-v4-pro",
+        "ANTHROPIC_MODEL": "glm-5.2",
         "ANTHROPIC_CONTEXT_WINDOW": "1000000",
-        "MAX_TOKENS": "1000000"
+        "MAX_TOKENS": "1000000",
+        "CLAUDE_CODE_EFFORT_LEVEL": "max"
   },
   "permissions": {
-
     "allow": [
       "Bash(git remote *)",
       "Bash(gh auth *)",
@@ -31,7 +31,10 @@
       "Bash(echo \"GC PID: $!\")",
       "Bash(echo \"CC PID: $!\")",
       "Bash(kill 5894 5897)",
-      "Bash(nvidia-smi)"
+      "Bash(nvidia-smi)",
+      "Bash(uv cache *)",
+      "Bash(rm -rf /root/.cache/JetBrains/*)",
+      "Bash(rm -rf /tmp/*)"
     ]
   }
 }
